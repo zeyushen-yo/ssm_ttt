@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+
+# Data (large files)
+data_cache/
+*.bin
+*.npy
+
+# Training runs (checkpoints, logs, plots)
+runs/
+wandb/
+
+# Environment
+envs/
+.env
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# PDF
+*.pdf
+
+# SLURM/build logs
+scripts/*.out
+scripts/*.log
