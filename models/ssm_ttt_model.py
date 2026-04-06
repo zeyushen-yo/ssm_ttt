@@ -1,15 +1,15 @@
 """
-SSM + In-Place TTT Language Model.
+SSM + In-Place TTT Language Model — v3.
 
 Builds on mamba_ssm's MixerModel/MambaLMHeadModel but replaces selected
 blocks with TTT-wrapped versions.
-
-Also provides a vanilla SSM model (no TTT) for baseline comparison.
 
 Key design:
 - TTT layers are selected per spec section 4.2: 4 evenly spaced layers
 - The forward pass threads source_embeddings through TTT blocks
 - Non-TTT blocks use the standard Mamba2 forward
+- Configurable target source: "embedding" or "layer_input"
+- Configurable source detachment
 """
 
 import math
@@ -48,7 +48,6 @@ def select_ttt_layers(n_layers: int, num_ttt_layers: int = 4):
         idx = round(i * n_layers / (num_ttt_layers + 1))
         idx = max(0, min(idx, n_layers - 1))
         indices.append(idx)
-    # Remove duplicates while preserving order
     seen = set()
     unique = []
     for idx in indices:
@@ -131,7 +130,7 @@ def create_block(
 class SSMTTTModel(nn.Module):
     """
     SSM backbone with optional TTT on selected layers.
-    
+
     When ttt_layer_indices is empty or None, this is a vanilla SSM.
     When ttt_layer_indices is provided, those layers get TTT wrapping.
     """
@@ -153,8 +152,17 @@ class SSMTTTModel(nn.Module):
         ttt_chunk_size: int = 256,
         ttt_kernel_size: int = 5,
         ttt_clip_tau: float = None,
-        ttt_inner_lr_init: float = 1.0,
-        ttt_decay_factor_init: float = None,
+        ttt_inner_lr_init: float = 0.10,
+        ttt_decay_factor_init: float = 0.95,
+        ttt_decay_min: float = 0.90,
+        ttt_decay_max: float = 0.995,
+        ttt_normalize_update: bool = True,
+        ttt_norm_eps: float = 1e-6,
+        ttt_deltaW_rel_cap: float = 0.10,
+        ttt_G_rel_cap: float = 0.02,
+        ttt_use_residual_fast_path: bool = False,
+        ttt_target_source: str = "embedding",
+        ttt_detach_source: bool = False,
         pad_vocab_size_multiple: int = 8,
         device=None,
         dtype=None,
@@ -167,6 +175,8 @@ class SSMTTTModel(nn.Module):
         self.residual_in_fp32 = residual_in_fp32
         self.fused_add_norm = fused_add_norm
         self.ttt_layer_indices = set(ttt_layer_indices or [])
+        self.ttt_target_source = ttt_target_source
+        self.ttt_detach_source = ttt_detach_source
 
         if vocab_size % pad_vocab_size_multiple != 0:
             vocab_size += pad_vocab_size_multiple - (vocab_size % pad_vocab_size_multiple)
@@ -178,7 +188,6 @@ class SSMTTTModel(nn.Module):
             if layer_norm_fn is None or rms_norm_fn is None:
                 raise ImportError("Failed to import Triton LayerNorm / RMSNorm kernels")
 
-        # Build layers
         layers = []
         for i in range(n_layer):
             block = create_block(
@@ -194,7 +203,6 @@ class SSMTTTModel(nn.Module):
             )
 
             if i in self.ttt_layer_indices:
-                # Wrap with TTT
                 ttt_block = TTTMamba2Block(
                     original_block=block,
                     d_model=d_model,
@@ -203,6 +211,13 @@ class SSMTTTModel(nn.Module):
                     clip_tau=ttt_clip_tau,
                     inner_lr_init=ttt_inner_lr_init,
                     decay_factor_init=ttt_decay_factor_init,
+                    decay_min=ttt_decay_min,
+                    decay_max=ttt_decay_max,
+                    normalize_update=ttt_normalize_update,
+                    norm_eps=ttt_norm_eps,
+                    deltaW_rel_cap=ttt_deltaW_rel_cap,
+                    g_rel_cap=ttt_G_rel_cap,
+                    use_residual_fast_path=ttt_use_residual_fast_path,
                     device=device,
                     dtype=dtype,
                 )
@@ -217,8 +232,6 @@ class SSMTTTModel(nn.Module):
         )
 
         self.lm_head = nn.Linear(d_model, vocab_size, bias=False, **factory_kwargs)
-
-        # Weight tying
         self.lm_head.weight = self.embedding.weight
 
         self.apply(
@@ -241,22 +254,36 @@ class SSMTTTModel(nn.Module):
         """
         hidden_states = self.embedding(input_ids)
 
-        # Source embeddings for TTT target builder (spec 4.5: use token embeddings)
-        source_embeddings = hidden_states.detach()
+        if self.ttt_target_source == "embedding":
+            source_embeddings = hidden_states
+            if self.ttt_detach_source:
+                source_embeddings = source_embeddings.detach()
+        else:
+            source_embeddings = None
 
         residual = None
         for layer in self.layers:
             if isinstance(layer, TTTMamba2Block):
+                if self.ttt_target_source == "layer_input":
+                    if not self.fused_add_norm:
+                        layer_source = (hidden_states + residual) if residual is not None else hidden_states
+                    else:
+                        layer_source = hidden_states
+                    if self.ttt_detach_source:
+                        layer_source = layer_source.detach()
+                    src = layer_source
+                else:
+                    src = source_embeddings
+
                 hidden_states, residual = layer(
                     hidden_states, residual,
-                    source_embeddings=source_embeddings,
+                    source_embeddings=src,
                 )
             else:
                 hidden_states, residual = layer(
                     hidden_states, residual,
                 )
 
-        # Final norm
         if not self.fused_add_norm:
             residual = (hidden_states + residual) if residual is not None else hidden_states
             hidden_states = self.norm_f(residual.to(dtype=self.norm_f.weight.dtype))
@@ -291,18 +318,11 @@ class SSMTTTModel(nn.Module):
         """Collect TTT health diagnostics from all TTT layers."""
         diagnostics = {}
         for i, layer in enumerate(self.layers):
-            if isinstance(layer, TTTMamba2Block) and layer._last_deltaW is not None:
-                dW = layer._last_deltaW
-                diagnostics[f"layer_{i}/deltaW_fro_mean"] = torch.norm(
-                    dW.reshape(dW.shape[0], -1), dim=1
-                ).mean().item()
-                diagnostics[f"layer_{i}/deltaW_fro_max"] = torch.norm(
-                    dW.reshape(dW.shape[0], -1), dim=1
-                ).max().item()
+            if isinstance(layer, TTTMamba2Block):
                 wrapper = layer.ttt_wrapper
-                diagnostics[f"layer_{i}/inner_lr"] = wrapper.log_inner_lr.exp().item()
-                if wrapper.log_decay_logit is not None:
-                    diagnostics[f"layer_{i}/decay_factor"] = torch.sigmoid(wrapper.log_decay_logit).item()
+                diag = wrapper._last_diagnostics
+                for key, val in diag.items():
+                    diagnostics[f"layer_{i}/{key}"] = val
         return diagnostics
 
     def count_parameters(self):
@@ -314,6 +334,11 @@ class SSMTTTModel(nn.Module):
                 ttt_params += sum(
                     p.numel() for p in layer.ttt_wrapper.target_builder.parameters()
                 )
+                ttt_params += 1  # log_inner_lr
+                if layer.ttt_wrapper.log_decay_logit is not None:
+                    ttt_params += 1  # log_decay_logit
+                if layer.ttt_wrapper.use_residual_fast_path:
+                    ttt_params += 1  # fast_gate
         return {
             "total": total,
             "ttt_extra": ttt_params,
@@ -332,6 +357,10 @@ def create_vanilla_ssm(
     """Create a vanilla SSM (no TTT) for baseline."""
     if ssm_cfg is None:
         ssm_cfg = {"layer": "Mamba2", "d_state": 128, "d_conv": 4, "expand": 2, "headdim": 64}
+    # Filter out TTT-specific kwargs that don't apply to vanilla SSM
+    ttt_keys = [k for k in kwargs if k.startswith('ttt_')]
+    for k in ttt_keys:
+        kwargs.pop(k)
     return SSMTTTModel(
         d_model=d_model,
         n_layer=n_layer,
@@ -350,18 +379,31 @@ def create_ssm_ttt(
     vocab_size: int = 50280,
     ssm_cfg=None,
     num_ttt_layers: int = 4,
+    ttt_layer_indices_override=None,
     ttt_chunk_size: int = 256,
     ttt_kernel_size: int = 5,
     ttt_clip_tau: float = None,
-    ttt_inner_lr_init: float = 1.0,
-    ttt_decay_factor_init: float = None,
+    ttt_inner_lr_init: float = 0.10,
+    ttt_decay_factor_init: float = 0.95,
+    ttt_decay_min: float = 0.90,
+    ttt_decay_max: float = 0.995,
+    ttt_normalize_update: bool = True,
+    ttt_norm_eps: float = 1e-6,
+    ttt_deltaW_rel_cap: float = 0.10,
+    ttt_G_rel_cap: float = 0.02,
+    ttt_use_residual_fast_path: bool = False,
+    ttt_target_source: str = "embedding",
+    ttt_detach_source: bool = False,
     **kwargs,
 ):
     """Create an SSM with in-place TTT."""
     if ssm_cfg is None:
         ssm_cfg = {"layer": "Mamba2", "d_state": 128, "d_conv": 4, "expand": 2, "headdim": 64}
 
-    ttt_layers = select_ttt_layers(n_layer, num_ttt_layers)
+    if ttt_layer_indices_override is not None:
+        ttt_layers = list(ttt_layer_indices_override)
+    else:
+        ttt_layers = select_ttt_layers(n_layer, num_ttt_layers)
     print(f"TTT-enabled layer indices: {ttt_layers}")
 
     return SSMTTTModel(
@@ -376,5 +418,14 @@ def create_ssm_ttt(
         ttt_clip_tau=ttt_clip_tau,
         ttt_inner_lr_init=ttt_inner_lr_init,
         ttt_decay_factor_init=ttt_decay_factor_init,
+        ttt_decay_min=ttt_decay_min,
+        ttt_decay_max=ttt_decay_max,
+        ttt_normalize_update=ttt_normalize_update,
+        ttt_norm_eps=ttt_norm_eps,
+        ttt_deltaW_rel_cap=ttt_deltaW_rel_cap,
+        ttt_G_rel_cap=ttt_G_rel_cap,
+        ttt_use_residual_fast_path=ttt_use_residual_fast_path,
+        ttt_target_source=ttt_target_source,
+        ttt_detach_source=ttt_detach_source,
         **kwargs,
     )

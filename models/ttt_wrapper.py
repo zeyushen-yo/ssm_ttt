@@ -1,14 +1,16 @@
 """
-TTT wrapper for SSM blocks.
+TTT wrapper for SSM blocks — v3 with normalized discounted update.
 
-Implements Sections 4.3-4.9 and 5.1-5.6 of the project spec:
-- Intercepts a Mamba2 block to expose pre-output features
-- Applies chunkwise apply-then-update with per-batch-item fast weights
-- Uses the TargetBuilder for LM-aligned targets
+Implements the revised math from the updated spec:
+- Normalized discounted update: DeltaW = decay * DeltaW + (1-decay) * eta * G
+- RMS normalization on update inputs (z, v)
+- Relative Frobenius cap on both G and cumulative DeltaW
+- Bounded decay range [decay_min, decay_max]
+- Optional residual fast path
 
-The execution order per chunk (spec 5.6):
+The execution order per chunk (unchanged):
 1. Compute frozen pre-output features Z_c
-2. Apply current W_0 + DeltaW_c
+2. Apply current W_0 + DeltaW_c (or W_0 + g * DeltaW_c for residual path)
 3. Compute Vhat_c
 4. Update DeltaW_{c+1}
 """
@@ -19,6 +21,23 @@ import torch.nn.functional as F
 from einops import rearrange
 
 from .target_builder import TargetBuilder
+
+
+def rms_norm_lastdim(x, eps=1e-6):
+    """Tokenwise RMS normalization along the last dimension (spec eq. 2)."""
+    rms = torch.sqrt(x.square().mean(dim=-1, keepdim=True) + eps)
+    return x / rms
+
+
+def project_fro_rel(deltaW, base_norm, rho, eps=1e-8):
+    """
+    Project deltaW to Frobenius ball of radius rho * base_norm (spec eq. 4).
+    deltaW: [B, d_out, d_in]
+    """
+    dw_norm = torch.norm(deltaW.reshape(deltaW.shape[0], -1), dim=1, keepdim=True).unsqueeze(-1)
+    max_norm = rho * base_norm
+    scale = torch.clamp(max_norm / (dw_norm + eps), max=1.0)
+    return deltaW * scale
 
 
 class TTTWrapper(nn.Module):
@@ -38,8 +57,15 @@ class TTTWrapper(nn.Module):
         chunk_size: int = 256,
         target_kernel_size: int = 5,
         clip_tau: float = None,
-        inner_lr_init: float = 1.0,
-        decay_factor_init: float = None,
+        inner_lr_init: float = 0.10,
+        decay_factor_init: float = 0.95,
+        decay_min: float = 0.90,
+        decay_max: float = 0.995,
+        normalize_update: bool = True,
+        norm_eps: float = 1e-6,
+        deltaW_rel_cap: float = 0.10,
+        g_rel_cap: float = 0.02,
+        use_residual_fast_path: bool = False,
         device=None,
         dtype=None,
     ):
@@ -49,6 +75,14 @@ class TTTWrapper(nn.Module):
         self.d_inner = mamba_block.d_inner
         self.chunk_size = chunk_size
         self.clip_tau = clip_tau
+        self.normalize_update = normalize_update
+        self.norm_eps = norm_eps
+        self.deltaW_rel_cap = deltaW_rel_cap
+        self.g_rel_cap = g_rel_cap
+        self.decay_min = decay_min
+        self.decay_max = decay_max
+        self.use_residual_fast_path = use_residual_fast_path
+        self.use_normalized_ema = normalize_update
 
         self.target_builder = TargetBuilder(
             d_model=d_model,
@@ -57,30 +91,40 @@ class TTTWrapper(nn.Module):
             dtype=torch.float32,
         )
 
-        # Learnable inner learning rate (per-layer scalar in log-space for stability)
         self.log_inner_lr = nn.Parameter(
             torch.tensor(inner_lr_init, device=device, dtype=torch.float32).log()
         )
 
-        # Optional learnable decay factor for DeltaW (EMA-style forgetting)
         if decay_factor_init is not None:
+            raw_init = (decay_factor_init - decay_min) / (decay_max - decay_min)
+            raw_init = max(1e-4, min(raw_init, 1.0 - 1e-4))
             self.log_decay_logit = nn.Parameter(
-                torch.tensor(decay_factor_init, device=device, dtype=torch.float32).logit()
+                torch.tensor(raw_init, device=device, dtype=torch.float32).logit()
             )
         else:
             self.log_decay_logit = None
 
-        # Store reference to original out_proj weight (spec 4.3: W_0^l)
-        # Shape: [d_model, d_inner]
+        if use_residual_fast_path:
+            self.fast_gate = nn.Parameter(
+                torch.tensor(0.01, device=device, dtype=torch.float32)
+            )
+
         self.base_out_proj_weight = mamba_block.out_proj.weight
         self.base_out_proj_bias = mamba_block.out_proj.bias
+
+        self._last_diagnostics = {}
+
+    def _get_decay(self):
+        """Compute bounded decay in [decay_min, decay_max] (spec eq. 6)."""
+        if self.log_decay_logit is None:
+            return None
+        raw = torch.sigmoid(self.log_decay_logit)
+        return self.decay_min + (self.decay_max - self.decay_min) * raw
 
     def _get_pre_out_features(self, u, seq_idx=None):
         """
         Run Mamba2 forward path up to (but not including) out_proj.
         Returns pre-output features y of shape [B, T, d_inner].
-
-        Uses the non-fused (slow) path to intercept before out_proj.
         """
         block = self.mamba_block
 
@@ -98,7 +142,6 @@ class TTTWrapper(nn.Module):
             dim=-1
         )
 
-        # Convolution
         try:
             from causal_conv1d import causal_conv1d_fn
         except ImportError:
@@ -161,25 +204,26 @@ class TTTWrapper(nn.Module):
 
         Returns:
             out: block output [B, T, d_model] (to be added to residual stream)
+            deltaW: final fast weight state [B, d_model, d_inner]
         """
         B, T, d = u.shape
         C = self.chunk_size
 
-        # Step 1: Get pre-output features (frozen SSM forward)
         z = self._get_pre_out_features(u, seq_idx=seq_idx)  # [B, T, d_inner]
-
-        # Step 2: Build LM-aligned targets
         vhat = self.target_builder(source_embeddings, chunk_size=C)  # [B, T, d_model]
 
-        # Step 3: Chunkwise apply-then-update loop
         W0 = self.base_out_proj_weight.float()  # [d_model, d_inner]
         bias = self.base_out_proj_bias
+        W0_norm = W0.norm().detach()
 
-        # Per-batch-item fast weights (spec 5.2)
         deltaW = torch.zeros(B, self.d_model, self.d_inner, device=u.device, dtype=torch.float32)
 
         eta = self.log_inner_lr.exp()
-        decay = torch.sigmoid(self.log_decay_logit) if self.log_decay_logit is not None else None
+        decay = self._get_decay()
+
+        G_fro_accum = 0.0
+        G_rel_accum = 0.0
+        n_chunks = 0
 
         outputs = []
         for s in range(0, T, C):
@@ -189,30 +233,71 @@ class TTTWrapper(nn.Module):
             zc = z[:, s:e, :]       # [B, chunk_len, d_inner]
             vc = vhat[:, s:e, :]     # [B, chunk_len, d_model]
 
-            # Apply: O = Z @ (W_0 + DeltaW)^T  (spec 4.7)
-            W_eff = W0.unsqueeze(0) + deltaW  # [B, d_model, d_inner]
-            oc = torch.bmm(zc.float(), W_eff.transpose(1, 2))  # [B, chunk_len, d_model]
+            # Apply: O = Z @ (W_0 + DeltaW)^T  (spec eq. 5)
+            if self.use_residual_fast_path:
+                base_oc = torch.bmm(zc.float(), W0.unsqueeze(0).transpose(1, 2))
+                fast_oc = torch.bmm(zc.float(), deltaW.transpose(1, 2))
+                oc = base_oc + self.fast_gate * fast_oc
+            else:
+                W_eff = W0.unsqueeze(0) + deltaW  # [B, d_model, d_inner]
+                oc = torch.bmm(zc.float(), W_eff.transpose(1, 2))  # [B, chunk_len, d_model]
 
             if bias is not None:
                 oc = oc + bias.float().unsqueeze(0).unsqueeze(0)
 
             outputs.append(oc.to(u.dtype))
 
-            # Update: G = eta * (1/C) * Vhat^T @ Z  (spec 4.9 + learnable inner LR)
-            G = eta * torch.bmm(vc.float().transpose(1, 2), zc.float()) / chunk_len  # [B, d_model, d_inner]
+            # Update: normalized discounted rule (spec eq. 1-3)
+            zc_fp32 = zc.float()
+            vc_fp32 = vc.float()
 
-            # Clipping (spec 4.10)
+            if self.normalize_update:
+                zc_u = rms_norm_lastdim(zc_fp32, eps=self.norm_eps)
+                vc_u = rms_norm_lastdim(vc_fp32, eps=self.norm_eps)
+            else:
+                zc_u = zc_fp32
+                vc_u = vc_fp32
+
+            G = torch.bmm(vc_u.transpose(1, 2), zc_u) / chunk_len  # [B, d_model, d_inner]
+
             if self.clip_tau is not None:
                 G_norm = torch.norm(G.reshape(B, -1), dim=1, keepdim=True).unsqueeze(-1)
                 scale = torch.clamp(self.clip_tau / (G_norm + 1e-8), max=1.0)
                 G = G * scale
 
+            if self.g_rel_cap is not None:
+                G = project_fro_rel(G, base_norm=W0_norm, rho=self.g_rel_cap)
+
+            G_fro = torch.norm(G.reshape(B, -1), dim=1).mean().item()
+            G_fro_accum += G_fro
+            G_rel_accum += G_fro / (W0_norm.item() + 1e-8)
+            n_chunks += 1
+
             if decay is not None:
-                deltaW = decay * deltaW + G
+                if self.use_normalized_ema:
+                    deltaW = decay * deltaW + (1.0 - decay) * eta * G
+                else:
+                    deltaW = decay * deltaW + eta * G
             else:
-                deltaW = deltaW + G
+                deltaW = deltaW + eta * G
+
+            if self.deltaW_rel_cap is not None:
+                deltaW = project_fro_rel(deltaW, base_norm=W0_norm, rho=self.deltaW_rel_cap)
 
         out = torch.cat(outputs, dim=1)  # [B, T, d_model]
+
+        dW_fro = torch.norm(deltaW.reshape(B, -1), dim=1).mean().item()
+        self._last_diagnostics = {
+            "deltaW_fro_mean": dW_fro,
+            "deltaW_rel_mean": dW_fro / (W0_norm.item() + 1e-8),
+            "G_fro_mean": G_fro_accum / max(n_chunks, 1),
+            "G_rel_mean": G_rel_accum / max(n_chunks, 1),
+            "decay": decay.item() if decay is not None else 0.0,
+            "effective_window_chunks": 1.0 / (1.0 - decay.item() + 1e-8) if decay is not None else float('inf'),
+            "effective_window_tokens": C / (1.0 - decay.item() + 1e-8) if decay is not None else float('inf'),
+            "inner_lr": eta.item(),
+        }
+
         return out, deltaW
 
 
@@ -229,8 +314,15 @@ class TTTMamba2Block(nn.Module):
         chunk_size: int = 256,
         target_kernel_size: int = 5,
         clip_tau: float = None,
-        inner_lr_init: float = 1.0,
-        decay_factor_init: float = None,
+        inner_lr_init: float = 0.10,
+        decay_factor_init: float = 0.95,
+        decay_min: float = 0.90,
+        decay_max: float = 0.995,
+        normalize_update: bool = True,
+        norm_eps: float = 1e-6,
+        deltaW_rel_cap: float = 0.10,
+        g_rel_cap: float = 0.02,
+        use_residual_fast_path: bool = False,
         device=None,
         dtype=None,
     ):
@@ -251,20 +343,23 @@ class TTTMamba2Block(nn.Module):
             clip_tau=clip_tau,
             inner_lr_init=inner_lr_init,
             decay_factor_init=decay_factor_init,
+            decay_min=decay_min,
+            decay_max=decay_max,
+            normalize_update=normalize_update,
+            norm_eps=norm_eps,
+            deltaW_rel_cap=deltaW_rel_cap,
+            g_rel_cap=g_rel_cap,
+            use_residual_fast_path=use_residual_fast_path,
             device=device,
             dtype=dtype,
         )
 
         self.layer_idx = getattr(original_block, 'layer_idx', None)
         self._last_deltaW = None
-        self._last_G_norm = None
 
     def forward(self, hidden_states, residual=None, inference_params=None,
                 source_embeddings=None, **mixer_kwargs):
-        """
-        Forward with TTT. Requires source_embeddings to be passed through.
-        """
-        # Residual + Norm (same as original Block)
+        """Forward with TTT. Requires source_embeddings to be passed through."""
         if not self.fused_add_norm:
             residual = (hidden_states + residual) if residual is not None else hidden_states
             hidden_states = self.norm(residual.to(dtype=self.norm.weight.dtype))
@@ -283,17 +378,14 @@ class TTTMamba2Block(nn.Module):
                 is_rms_norm=isinstance(self.norm, RMSNorm)
             )
 
-        # TTT-wrapped Mamba2 forward
         assert source_embeddings is not None, "TTT blocks require source_embeddings"
         hidden_states, deltaW = self.ttt_wrapper(
             hidden_states, source_embeddings,
             seq_idx=mixer_kwargs.get('seq_idx', None),
         )
 
-        # Store diagnostics
         self._last_deltaW = deltaW.detach()
 
-        # MLP (if present, same as original Block)
         if self.mlp is not None:
             if not self.fused_add_norm:
                 residual = hidden_states + residual

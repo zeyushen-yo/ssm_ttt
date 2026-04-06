@@ -1,5 +1,5 @@
 """
-Figure-2-style sliding-window perplexity evaluation.
+Figure-2-style sliding-window perplexity evaluation — v2.
 
 Spec Section 7: For each validation document:
 1. Fix a scored suffix of the last 2048 tokens
@@ -7,6 +7,10 @@ Spec Section 7: For each validation document:
    - Provide only the last L tokens to the model
    - Compute NLL/perplexity only on the fixed final 2048-token suffix
 3. Average over all validation documents
+
+v2 additions:
+- Per-layer deltaW_rel diagnostics for TTT models at each context length
+- Support for larger validation sets (>= 50 long documents)
 """
 
 import argparse
@@ -79,6 +83,28 @@ def load_model_from_checkpoint(checkpoint_path, device="cuda"):
     return model, config
 
 
+def collect_ttt_eval_diagnostics(model):
+    """Collect per-layer deltaW diagnostics during evaluation."""
+    diagnostics = {}
+    if not isinstance(model, SSMTTTModel):
+        return diagnostics
+    for i, layer in enumerate(model.layers):
+        if isinstance(layer, TTTMamba2Block):
+            wrapper = layer.ttt_wrapper
+            diag = wrapper._last_diagnostics
+            if diag:
+                diagnostics[f"layer_{i}/deltaW_rel_mean"] = diag.get("deltaW_rel_mean", 0.0)
+                diagnostics[f"layer_{i}/deltaW_fro_mean"] = diag.get("deltaW_fro_mean", 0.0)
+                diagnostics[f"layer_{i}/decay"] = diag.get("decay", 0.0)
+                diagnostics[f"layer_{i}/inner_lr"] = diag.get("inner_lr", 0.0)
+            if layer._last_deltaW is not None:
+                dW = layer._last_deltaW
+                W0_norm = wrapper.base_out_proj_weight.float().norm().item()
+                dW_norms = torch.norm(dW.reshape(dW.shape[0], -1), dim=1)
+                diagnostics[f"layer_{i}/deltaW_rel_max"] = (dW_norms.max().item() / (W0_norm + 1e-8))
+    return diagnostics
+
+
 @torch.no_grad()
 def evaluate_sliding_window_ppl(
     model,
@@ -92,18 +118,14 @@ def evaluate_sliding_window_ppl(
     """
     Evaluate sliding-window perplexity at multiple context lengths.
 
-    For each document and context length L:
-    - Take the last L tokens of the document
-    - Score only the final scored_suffix_len tokens
-    - Report average PPL across all documents
-
-    Returns: {context_len: ppl}
+    Returns: {context_len: ppl}, {context_len: ttt_diagnostics}
     """
     if context_lengths is None:
         context_lengths = CONTEXT_LENGTHS
 
     model.eval()
     results = {}
+    ttt_diag_by_ctx = {}
 
     for L in context_lengths:
         if L < scored_suffix_len:
@@ -113,6 +135,7 @@ def evaluate_sliding_window_ppl(
         total_nll = 0.0
         total_tokens = 0
         n_docs = 0
+        all_diags = []
 
         for doc in tqdm(documents, desc=f"L={L}", leave=False):
             if len(doc) < L:
@@ -122,7 +145,7 @@ def evaluate_sliding_window_ppl(
 
             with torch.autocast(device_type="cuda", dtype=dtype):
                 output = model(input_ids)
-            logits = output.logits.float()  # [1, L, V] in fp32 for accurate loss
+            logits = output.logits.float()  # [1, L, V]
 
             suffix_start = L - scored_suffix_len
             if suffix_start == 0:
@@ -143,6 +166,11 @@ def evaluate_sliding_window_ppl(
             total_tokens += n_scored
             n_docs += 1
 
+            if is_ttt:
+                diag = collect_ttt_eval_diagnostics(model)
+                if diag:
+                    all_diags.append(diag)
+
         if total_tokens > 0:
             avg_nll = total_nll / total_tokens
             ppl = math.exp(min(avg_nll, 100))
@@ -151,9 +179,24 @@ def evaluate_sliding_window_ppl(
             ppl = float('inf')
 
         results[L] = ppl
-        print(f"  Context {L:>6} ({L//1024:>2}k): PPL = {ppl:8.2f}  (n_docs={n_docs}, avg_nll={avg_nll:.4f})")
 
-    return results
+        if all_diags:
+            avg_diag = {}
+            for key in all_diags[0]:
+                vals = [d[key] for d in all_diags if key in d]
+                avg_diag[key] = sum(vals) / len(vals)
+            ttt_diag_by_ctx[L] = avg_diag
+
+        diag_str = ""
+        if L in ttt_diag_by_ctx:
+            rel_means = {k: v for k, v in ttt_diag_by_ctx[L].items() if "deltaW_rel_mean" in k}
+            if rel_means:
+                diag_str = " | " + " ".join(f"{k.split('/')[0]}={v:.4f}" for k, v in sorted(rel_means.items()))
+
+        print(f"  Context {L:>6} ({L//1024:>2}k): PPL = {ppl:8.2f}  "
+              f"(n_docs={n_docs}, avg_nll={avg_nll:.4f}){diag_str}")
+
+    return results, ttt_diag_by_ctx
 
 
 def plot_figure2(results_dict, output_path="figure2.png", title="Sliding-Window Perplexity"):
@@ -166,8 +209,15 @@ def plot_figure2(results_dict, output_path="figure2.png", title="Sliding-Window 
     for name, results in results_dict.items():
         ctx = sorted(results.keys())
         ppls = [results[c] for c in ctx]
-        ax.plot(ctx, ppls, marker=markers.get(name, "o"), label=name,
-                color=colors.get(name, None), linewidth=2, markersize=8)
+        color = None
+        marker = "o"
+        for prefix in colors:
+            if prefix in name:
+                color = colors[prefix]
+                marker = markers[prefix]
+                break
+        ax.plot(ctx, ppls, marker=marker, label=name,
+                color=color, linewidth=2, markersize=8)
 
     ax.set_xlabel("Context Length", fontsize=12)
     ax.set_ylabel("Perplexity", fontsize=12)
@@ -206,6 +256,7 @@ if __name__ == "__main__":
     print(f"Using {len(documents)} documents for evaluation")
 
     all_results = {}
+    all_ttt_diag = {}
     for ckpt_path, name in zip(args.checkpoints, args.names):
         print(f"\n{'='*60}")
         print(f"Evaluating: {name}")
@@ -215,7 +266,7 @@ if __name__ == "__main__":
         model, config = load_model_from_checkpoint(ckpt_path, device=args.device)
         is_ttt = config["model_type"] == "ssm_ttt"
 
-        results = evaluate_sliding_window_ppl(
+        results, ttt_diag = evaluate_sliding_window_ppl(
             model, documents,
             context_lengths=context_lengths,
             scored_suffix_len=args.scored_suffix_len,
@@ -223,6 +274,8 @@ if __name__ == "__main__":
             is_ttt=is_ttt,
         )
         all_results[name] = results
+        if ttt_diag:
+            all_ttt_diag[name] = ttt_diag
 
         del model
         torch.cuda.empty_cache()
@@ -236,9 +289,27 @@ if __name__ == "__main__":
         row = f"{name:<20}" + "".join(f"{results.get(L, float('inf')):8.2f}" for L in sorted(context_lengths))
         print(row)
 
+    if all_ttt_diag:
+        print(f"\nTTT Diagnostics (deltaW_rel_mean per layer):")
+        for name, diag_by_ctx in all_ttt_diag.items():
+            print(f"\n  {name}:")
+            for L in sorted(diag_by_ctx.keys()):
+                diag = diag_by_ctx[L]
+                rel_means = {k: v for k, v in sorted(diag.items()) if "deltaW_rel_mean" in k}
+                parts = " ".join(f"{k.split('/')[0]}={v:.4f}" for k, v in rel_means.items())
+                print(f"    {L//1024}k: {parts}")
+
     results_path = args.output.replace(".png", "_results.json")
+    save_data = {
+        "ppl": {k: {str(kk): vv for kk, vv in v.items()} for k, v in all_results.items()},
+    }
+    if all_ttt_diag:
+        save_data["ttt_diagnostics"] = {
+            name: {str(L): diag for L, diag in ctx_diag.items()}
+            for name, ctx_diag in all_ttt_diag.items()
+        }
     with open(results_path, "w") as f:
-        json.dump({k: {str(kk): vv for kk, vv in v.items()} for k, v in all_results.items()}, f, indent=2)
+        json.dump(save_data, f, indent=2)
     print(f"\nSaved results to {results_path}")
 
     plot_figure2(all_results, output_path=args.output)

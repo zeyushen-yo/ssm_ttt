@@ -1,12 +1,12 @@
 """
-Data pipeline for training and evaluation.
+Data pipeline for training and evaluation — v2.
 
-Supports two modes:
-1. Streaming from HuggingFace (login node / internet)
-2. Loading from pre-tokenized .bin files (compute nodes / offline)
+Uses document-offset-based sampling to guarantee single-document sequences.
+Worker RNG is properly seeded per (base_seed, worker_id, idx) to avoid
+duplication across dataloader workers.
 
 Spec constraints:
-- Each sample = one contiguous document segment (no multi-document packing in Phase 1)
+- Each sample = one contiguous document segment (no multi-document packing)
 - Shared tokenizer across all three models (GPT-NeoX)
 - Document-boundary resets for TTT
 """
@@ -26,17 +26,88 @@ def get_tokenizer(name="EleutherAI/gpt-neox-20b"):
     return tokenizer
 
 
+class DocOffsetTrainDataset(Dataset):
+    """
+    Training dataset using document offsets for guaranteed single-document samples.
+
+    Each __getitem__ call:
+    1. Derives a per-(worker, idx) RNG seed
+    2. Samples a document from train_offsets.npy
+    3. Samples a start position within that document
+    4. Returns exactly seq_len tokens from that document (padded at doc end if needed)
+    """
+
+    def __init__(self, data_path, offsets_path, seq_len=2048, eos_token_id=0,
+                 seed=42, min_doc_len=256):
+        self.seq_len = seq_len
+        self.eos_token_id = eos_token_id
+        self.seed = seed
+
+        self.data = np.memmap(data_path, dtype=np.uint16, mode='r')
+        self.offsets = np.load(offsets_path)
+        self.n_docs = len(self.offsets) - 1
+
+        self.doc_lengths = self.offsets[1:] - self.offsets[:-1]
+        self.valid_doc_mask = self.doc_lengths >= min_doc_len
+        self.valid_doc_indices = np.where(self.valid_doc_mask)[0]
+        self.n_valid_docs = len(self.valid_doc_indices)
+
+        meta_path = data_path.replace('.bin', '_meta.txt')
+        if os.path.exists(meta_path):
+            with open(meta_path) as f:
+                for line in f:
+                    if line.startswith("num_tokens="):
+                        self.n_tokens = int(line.strip().split("=")[1])
+                        break
+                else:
+                    self.n_tokens = len(self.data)
+        else:
+            self.n_tokens = len(self.data)
+
+        print(f"DocOffsetTrainDataset: {self.n_tokens:,} tokens, "
+              f"{self.n_docs} total docs, {self.n_valid_docs} valid docs (>={min_doc_len})")
+
+        self._len = self.n_tokens // seq_len
+
+    def __len__(self):
+        return self._len
+
+    def __getitem__(self, idx):
+        worker_info = torch.utils.data.get_worker_info()
+        worker_id = 0 if worker_info is None else worker_info.id
+        rng = np.random.default_rng(self.seed + 1000003 * worker_id + idx)
+
+        doc_idx = self.valid_doc_indices[rng.integers(0, self.n_valid_docs)]
+        doc_start = self.offsets[doc_idx]
+        doc_end = self.offsets[doc_idx + 1]
+        doc_len = doc_end - doc_start
+
+        if doc_len <= self.seq_len:
+            start = doc_start
+            tokens = self.data[start:doc_end].astype(np.int64)
+            if len(tokens) < self.seq_len:
+                tokens = np.pad(tokens, (0, self.seq_len - len(tokens)),
+                                constant_values=self.eos_token_id)
+        else:
+            max_start_within_doc = doc_len - self.seq_len
+            offset_in_doc = rng.integers(0, max_start_within_doc + 1)
+            start = doc_start + offset_in_doc
+            tokens = self.data[start:start + self.seq_len].astype(np.int64)
+
+        input_ids = torch.from_numpy(tokens.copy())
+        return {"input_ids": input_ids, "labels": input_ids.clone()}
+
+
 class PreTokenizedTrainDataset(Dataset):
     """
-    Dataset loading from pre-tokenized .bin file (memory-mapped).
-
-    Each item is a contiguous chunk of seq_len tokens from a single document.
-    We split at EOS tokens to respect document boundaries (no packing).
+    Fallback dataset for data_cache without train_offsets.npy.
+    Uses the old random-start approach but with proper worker RNG.
     """
 
     def __init__(self, data_path, seq_len=2048, eos_token_id=0, seed=42):
         self.seq_len = seq_len
         self.eos_token_id = eos_token_id
+        self.seed = seed
 
         self.data = np.memmap(data_path, dtype=np.uint16, mode='r')
 
@@ -50,54 +121,37 @@ class PreTokenizedTrainDataset(Dataset):
                 else:
                     self.n_tokens = len(self.data)
         else:
-            self.n_tokens = self._find_valid_extent()
+            self.n_tokens = len(self.data)
 
-        print(f"PreTokenizedTrainDataset: using {self.n_tokens:,} / {len(self.data):,} tokens")
-
-        self.rng = np.random.RandomState(seed)
+        print(f"PreTokenizedTrainDataset (fallback): {self.n_tokens:,} tokens")
         self._len = self.n_tokens // seq_len
-
-    def _find_valid_extent(self):
-        """Binary search for the boundary between written and unwritten data."""
-        total = len(self.data)
-        lo, hi = 0, total
-        while lo < hi:
-            mid = (lo + hi) // 2
-            chunk = self.data[mid:min(mid + 10, total)]
-            if any(chunk != 0):
-                lo = mid + 1
-            else:
-                hi = mid
-        return lo
 
     def __len__(self):
         return self._len
 
     def __getitem__(self, idx):
-        # Random start position (avoid last seq_len tokens)
+        worker_info = torch.utils.data.get_worker_info()
+        worker_id = 0 if worker_info is None else worker_info.id
+        rng = np.random.default_rng(self.seed + 1000003 * worker_id + idx)
+
         max_start = self.n_tokens - self.seq_len - 1
         if max_start <= 0:
             start = 0
         else:
-            start = self.rng.randint(0, max_start)
+            start = rng.integers(0, max_start)
 
         tokens = self.data[start:start + self.seq_len].astype(np.int64)
 
-        # Check if there's an EOS within this chunk - if so, only use up to first EOS
-        # This ensures no cross-document contamination
         eos_positions = np.where(tokens == self.eos_token_id)[0]
         if len(eos_positions) > 0:
-            # Start from after the first EOS to get a clean document start
             first_eos = eos_positions[0]
             if first_eos < self.seq_len - 256:
-                # Enough tokens after EOS
                 remaining = tokens[first_eos + 1:]
                 if len(remaining) >= 256:
                     tokens = remaining[:self.seq_len]
-                    # Pad if needed
                     if len(tokens) < self.seq_len:
                         tokens = np.pad(tokens, (0, self.seq_len - len(tokens)),
-                                       constant_values=self.eos_token_id)
+                                        constant_values=self.eos_token_id)
 
         input_ids = torch.from_numpy(tokens.copy())
         return {"input_ids": input_ids, "labels": input_ids.clone()}
@@ -109,7 +163,7 @@ class PreTokenizedValDataset(Dataset):
     Each item is one document (up to max_len tokens).
     """
 
-    def __init__(self, data_path, offsets_path, max_len=32768):
+    def __init__(self, data_path, offsets_path, max_len=65536):
         self.data = np.memmap(data_path, dtype=np.uint16, mode='r')
         self.offsets = np.load(offsets_path)
         self.max_len = max_len
@@ -167,27 +221,39 @@ def create_train_dataloader(
     dataset_name="monology/pile-uncopyrighted",
     seed=42,
 ):
-    """Create training dataloader. Uses pre-tokenized data if available."""
-    if data_dir and os.path.exists(os.path.join(data_dir, "train.bin")):
-        print(f"Loading pre-tokenized data from {data_dir}/train.bin")
-        eos_id = tokenizer.eos_token_id if tokenizer else 0
-        dataset = PreTokenizedTrainDataset(
-            os.path.join(data_dir, "train.bin"),
-            seq_len=seq_len,
-            eos_token_id=eos_id,
-            seed=seed,
-        )
-        return DataLoader(
-            dataset, batch_size=batch_size, shuffle=True,
-            num_workers=num_workers, pin_memory=True, drop_last=True,
-        )
-    else:
-        print("Using streaming dataset (requires internet)")
-        assert tokenizer is not None
-        dataset = StreamingTrainDataset(
-            tokenizer, seq_len=seq_len, dataset_name=dataset_name, seed=seed,
-        )
-        return DataLoader(
-            dataset, batch_size=batch_size,
-            num_workers=num_workers, pin_memory=True, drop_last=True,
-        )
+    """Create training dataloader. Prefers doc-offset dataset, falls back to old format."""
+    if data_dir:
+        train_bin = os.path.join(data_dir, "train.bin")
+        offsets_file = os.path.join(data_dir, "train_offsets.npy")
+
+        if os.path.exists(train_bin) and os.path.exists(offsets_file):
+            print(f"Loading doc-offset training data from {data_dir}")
+            eos_id = tokenizer.eos_token_id if tokenizer else 0
+            dataset = DocOffsetTrainDataset(
+                train_bin, offsets_file,
+                seq_len=seq_len, eos_token_id=eos_id, seed=seed,
+            )
+            return DataLoader(
+                dataset, batch_size=batch_size, shuffle=True,
+                num_workers=num_workers, pin_memory=True, drop_last=True,
+            )
+        elif os.path.exists(train_bin):
+            print(f"Loading pre-tokenized data (no offsets) from {data_dir}/train.bin")
+            eos_id = tokenizer.eos_token_id if tokenizer else 0
+            dataset = PreTokenizedTrainDataset(
+                train_bin, seq_len=seq_len, eos_token_id=eos_id, seed=seed,
+            )
+            return DataLoader(
+                dataset, batch_size=batch_size, shuffle=True,
+                num_workers=num_workers, pin_memory=True, drop_last=True,
+            )
+
+    print("Using streaming dataset (requires internet)")
+    assert tokenizer is not None
+    dataset = StreamingTrainDataset(
+        tokenizer, seq_len=seq_len, dataset_name=dataset_name, seed=seed,
+    )
+    return DataLoader(
+        dataset, batch_size=batch_size,
+        num_workers=num_workers, pin_memory=True, drop_last=True,
+    )

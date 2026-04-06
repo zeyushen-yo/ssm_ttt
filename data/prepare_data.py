@@ -4,8 +4,11 @@ Pre-tokenize and save training/validation data for offline use on compute nodes.
 Downloads from HuggingFace on login node, tokenizes, and saves as memory-mapped
 numpy arrays for fast loading during training.
 
+v2: Also saves train_offsets.npy (document boundary offsets for the training set)
+    and a long-document validation set (min_doc_len >= 32768, target >= 50 docs).
+
 Usage (run on login node with internet):
-  python data/prepare_data.py --output_dir /scratch/gpfs/HENDERSON/zs7353/ssm_ttt/data_cache --num_tokens 2000000000
+  python data/prepare_data.py --output_dir /scratch/gpfs/HENDERSON/zs7353/ssm_ttt/data_cache_v2 --num_tokens 2000000000
 """
 
 import argparse
@@ -28,13 +31,15 @@ def get_tokenizer(name="EleutherAI/gpt-neox-20b"):
 
 def prepare_train_data(tokenizer, output_dir, num_tokens=2_000_000_000,
                        dataset_name="monology/pile-uncopyrighted"):
-    """Download, tokenize, and save training data incrementally to memmap."""
+    """Download, tokenize, and save training data with document offsets."""
     os.makedirs(output_dir, exist_ok=True)
     out_path = os.path.join(output_dir, "train.bin")
+    offsets_path = os.path.join(output_dir, "train_offsets.npy")
 
-    if os.path.exists(out_path):
+    if os.path.exists(out_path) and os.path.exists(offsets_path):
         existing = np.memmap(out_path, dtype=np.uint16, mode='r')
-        print(f"Train data already exists: {len(existing):,} tokens")
+        offsets = np.load(offsets_path)
+        print(f"Train data already exists: {len(existing):,} tokens, {len(offsets)-1} documents")
         if len(existing) >= num_tokens:
             print("Sufficient tokens already downloaded.")
             return out_path
@@ -44,11 +49,13 @@ def prepare_train_data(tokenizer, output_dir, num_tokens=2_000_000_000,
     dataset = load_dataset(dataset_name, split="train", streaming=True, trust_remote_code=True)
 
     fp = np.memmap(out_path, dtype=np.uint16, mode='w+', shape=(num_tokens,))
-    
+
     buf = np.empty(CHUNK_SIZE, dtype=np.uint16)
     buf_pos = 0
     written = 0
     eos_id = tokenizer.eos_token_id
+
+    doc_offsets = [0]
 
     for example in tqdm(dataset, desc="Tokenizing"):
         text = example.get("text", "")
@@ -79,6 +86,9 @@ def prepare_train_data(tokenizer, output_dir, num_tokens=2_000_000_000,
             buf_pos = len(leftover)
             buf[:buf_pos] = leftover
 
+        doc_end = written + buf_pos
+        doc_offsets.append(doc_end)
+
         if written + buf_pos >= num_tokens:
             break
 
@@ -102,29 +112,46 @@ def prepare_train_data(tokenizer, output_dir, num_tokens=2_000_000_000,
         fp2.flush()
         del fp2
 
+    doc_offsets = [o for o in doc_offsets if o <= actual_tokens]
+    if doc_offsets[-1] != actual_tokens:
+        doc_offsets.append(actual_tokens)
+    doc_offsets = np.array(doc_offsets, dtype=np.int64)
+    np.save(offsets_path, doc_offsets)
+
     meta_path = os.path.join(output_dir, "train_meta.txt")
     with open(meta_path, "w") as f:
         f.write(f"num_tokens={actual_tokens}\n")
+        f.write(f"num_documents={len(doc_offsets)-1}\n")
         f.write(f"dtype=uint16\n")
         f.write(f"vocab_size={tokenizer.vocab_size}\n")
         f.write(f"eos_token_id={eos_id}\n")
 
-    print(f"Done. Saved {actual_tokens:,} tokens to {out_path} ({os.path.getsize(out_path) / 1e9:.2f} GB)")
+    print(f"Done. Saved {actual_tokens:,} tokens, {len(doc_offsets)-1} documents to {out_path}")
+    print(f"Document offsets: {offsets_path}")
     return out_path
 
 
-def prepare_val_data(tokenizer, output_dir, max_docs=200,
+def prepare_val_data(tokenizer, output_dir, max_docs=200, min_doc_len=32768,
                      dataset_name="monology/pile-uncopyrighted"):
-    """Download, tokenize, and save validation data."""
+    """Download, tokenize, and save validation data with long documents."""
     os.makedirs(output_dir, exist_ok=True)
     out_path = os.path.join(output_dir, "val.bin")
     offsets_path = os.path.join(output_dir, "val_offsets.npy")
 
     if os.path.exists(out_path) and os.path.exists(offsets_path):
-        print(f"Validation data already exists at {out_path}")
-        return out_path
+        existing_offsets = np.load(offsets_path)
+        n_existing = len(existing_offsets) - 1
+        if n_existing >= 50:
+            data_mm = np.memmap(out_path, dtype=np.uint16, mode='r')
+            min_existing_len = min(
+                existing_offsets[i+1] - existing_offsets[i] for i in range(n_existing)
+            )
+            if min_existing_len >= min_doc_len:
+                print(f"Validation data already exists: {n_existing} docs (min len {min_existing_len})")
+                return out_path
+        print(f"Existing val data insufficient, regenerating...")
 
-    print(f"Downloading validation data (up to {max_docs} long docs)...")
+    print(f"Downloading validation data (>= {min_doc_len} tokens, up to {max_docs} docs)...")
 
     try:
         dataset = load_dataset(dataset_name, split="validation", streaming=True, trust_remote_code=True)
@@ -140,16 +167,18 @@ def prepare_val_data(tokenizer, output_dir, max_docs=200,
     offsets = [0]
     count = 0
     eos_id = tokenizer.eos_token_id
+    scanned = 0
 
     for example in tqdm(dataset, desc="Tokenizing val"):
         text = example.get("text", "")
         if not text:
             continue
+        scanned += 1
 
         tokens = tokenizer.encode(text, add_special_tokens=False)
 
-        if len(tokens) >= 4096:
-            tokens = tokens[:32768]
+        if len(tokens) >= min_doc_len:
+            tokens = tokens[:65536]
             all_tokens.extend(tokens)
             offsets.append(len(all_tokens))
             count += 1
@@ -157,10 +186,18 @@ def prepare_val_data(tokenizer, output_dir, max_docs=200,
         if count >= max_docs:
             break
 
+        if scanned > 500000 and count < 10:
+            print(f"Warning: scanned {scanned} docs but only found {count} with >= {min_doc_len} tokens")
+            print(f"Falling back to min_doc_len=4096")
+            min_doc_len = 4096
+            if count >= max_docs:
+                break
+
     all_tokens = np.array(all_tokens, dtype=np.uint16)
     offsets = np.array(offsets, dtype=np.int64)
 
-    print(f"Saving {count} validation documents ({len(all_tokens):,} tokens)")
+    print(f"Saving {count} validation documents ({len(all_tokens):,} tokens), "
+          f"scanned {scanned} total docs")
 
     fp = np.memmap(out_path, dtype=np.uint16, mode='w+', shape=all_tokens.shape)
     fp[:] = all_tokens[:]
@@ -174,10 +211,11 @@ def prepare_val_data(tokenizer, output_dir, max_docs=200,
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--output_dir", default="/scratch/gpfs/HENDERSON/zs7353/ssm_ttt/data_cache")
+    parser.add_argument("--output_dir", default="/scratch/gpfs/HENDERSON/zs7353/ssm_ttt/data_cache_v2")
     parser.add_argument("--num_tokens", type=int, default=2_000_000_000,
                         help="Number of training tokens to prepare")
     parser.add_argument("--max_val_docs", type=int, default=200)
+    parser.add_argument("--min_val_doc_len", type=int, default=32768)
     parser.add_argument("--tokenizer", default="EleutherAI/gpt-neox-20b")
     args = parser.parse_args()
 
@@ -185,4 +223,5 @@ if __name__ == "__main__":
     print(f"Tokenizer: {args.tokenizer}, vocab_size: {tokenizer.vocab_size}")
 
     prepare_train_data(tokenizer, args.output_dir, num_tokens=args.num_tokens)
-    prepare_val_data(tokenizer, args.output_dir, max_docs=args.max_val_docs)
+    prepare_val_data(tokenizer, args.output_dir, max_docs=args.max_val_docs,
+                     min_doc_len=args.min_val_doc_len)

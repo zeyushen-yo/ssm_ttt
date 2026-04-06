@@ -31,3 +31,5 @@ Thumbs.db
 # SLURM/build logs
 scripts/*.out
 scripts/*.log
+*.npy
+data_cache_v2/
