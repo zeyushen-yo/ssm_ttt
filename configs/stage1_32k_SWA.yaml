@@ -1,0 +1,28 @@
+# SWA Transformer baseline — Stage 1 at seq_len=32768 (200M tokens)
+model_type: transformer_swa
+model_args:
+  d_model: 768
+  n_layer: 12
+  d_ff: 2048
+  num_heads: 12
+  window_size: 512
+
+seq_len: 32768
+batch_size: 1
+total_tokens: 200000000
+lr: 0.0006
+weight_decay: 0.1
+betas: [0.9, 0.95]
+warmup_steps: 512
+grad_clip: 1.0
+use_amp: true
+seed: 42
+
+data_dir: /scratch/gpfs/HENDERSON/zs7353/ssm_ttt/data_cache_v2
+num_workers: 4
+pack_documents: true
+
+log_interval: 50
+save_interval: 2000
+eval_interval: 2000
+output_dir: /scratch/gpfs/HENDERSON/zs7353/ssm_ttt/runs/stage1_32kp_SWA

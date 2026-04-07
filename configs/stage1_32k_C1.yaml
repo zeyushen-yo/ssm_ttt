@@ -1,6 +1,4 @@
-# C4: same as C2 but ttt_target_source = layer_input
 model_type: ssm_ttt
-
 model_args:
   d_model: 768
   n_layer: 24
@@ -14,39 +12,35 @@ model_args:
   rms_norm: true
   residual_in_fp32: true
   fused_add_norm: false
-
   num_ttt_layers: 4
-  ttt_chunk_size: 64
+  ttt_chunk_size: 128
   ttt_kernel_size: 5
-
-  ttt_target_source: layer_input
+  ttt_target_source: embedding
   ttt_detach_source: false
-
-  ttt_inner_lr_init: 0.10
+  ttt_inner_lr_init: 0.1
   ttt_decay_factor_init: 0.95
-  ttt_decay_min: 0.90
+  ttt_decay_min: 0.9
   ttt_decay_max: 0.995
-
   ttt_normalize_update: true
-  ttt_norm_eps: 1.0e-6
-  ttt_deltaW_rel_cap: 0.10
+  ttt_norm_eps: 1.0e-06
+  ttt_deltaW_rel_cap: 0.1
   ttt_G_rel_cap: 0.02
-
-seq_len: 2048
-batch_size: 8
+seq_len: 32768
+batch_size: 1
 total_tokens: 200000000
 lr: 0.0006
 weight_decay: 0.1
-betas: [0.9, 0.95]
+betas:
+- 0.9
+- 0.95
 warmup_steps: 512
 grad_clip: 1.0
 use_amp: true
 seed: 42
-
 data_dir: /scratch/gpfs/HENDERSON/zs7353/ssm_ttt/data_cache_v2
 num_workers: 4
-
+pack_documents: true
 log_interval: 50
-save_interval: 2000
+save_interval: 1000
 eval_interval: 2000
-output_dir: /scratch/gpfs/HENDERSON/zs7353/ssm_ttt/runs/stage1v2_C4
+output_dir: /scratch/gpfs/HENDERSON/zs7353/ssm_ttt/runs/stage1_32kp_C1

@@ -84,18 +84,71 @@ class DocOffsetTrainDataset(Dataset):
 
         if doc_len <= self.seq_len:
             start = doc_start
-            tokens = self.data[start:doc_end].astype(np.int64)
-            if len(tokens) < self.seq_len:
-                tokens = np.pad(tokens, (0, self.seq_len - len(tokens)),
+            real_tokens = self.data[start:doc_end].astype(np.int64)
+            real_len = len(real_tokens)
+            if real_len < self.seq_len:
+                tokens = np.pad(real_tokens, (0, self.seq_len - real_len),
                                 constant_values=self.eos_token_id)
+            else:
+                tokens = real_tokens
+                real_len = self.seq_len
         else:
             max_start_within_doc = doc_len - self.seq_len
             offset_in_doc = rng.integers(0, max_start_within_doc + 1)
             start = doc_start + offset_in_doc
             tokens = self.data[start:start + self.seq_len].astype(np.int64)
+            real_len = self.seq_len
 
         input_ids = torch.from_numpy(tokens.copy())
-        return {"input_ids": input_ids, "labels": input_ids.clone()}
+        labels = input_ids.clone()
+        if real_len < self.seq_len:
+            labels[real_len:] = -100
+        return {"input_ids": input_ids, "labels": labels}
+
+
+class PackedTrainDataset(Dataset):
+    """
+    Packed document training dataset for long-context pre-training.
+    Reads contiguous chunks of seq_len tokens from the full corpus,
+    allowing sequences to span document boundaries. This gives access
+    to the entire corpus regardless of individual document lengths.
+    """
+
+    def __init__(self, data_path, seq_len=32768, seed=42):
+        self.seq_len = seq_len
+        self.seed = seed
+        self.data = np.memmap(data_path, dtype=np.uint16, mode='r')
+
+        meta_path = data_path.replace('.bin', '_meta.txt')
+        if os.path.exists(meta_path):
+            with open(meta_path) as f:
+                for line in f:
+                    if line.startswith("num_tokens="):
+                        self.n_tokens = int(line.strip().split("=")[1])
+                        break
+                else:
+                    self.n_tokens = len(self.data)
+        else:
+            self.n_tokens = len(self.data)
+
+        print(f"PackedTrainDataset: {self.n_tokens:,} tokens, seq_len={seq_len}")
+        self._len = self.n_tokens // seq_len
+
+    def __len__(self):
+        return self._len
+
+    def __getitem__(self, idx):
+        worker_info = torch.utils.data.get_worker_info()
+        worker_id = 0 if worker_info is None else worker_info.id
+        rng = np.random.default_rng(self.seed + 1000003 * worker_id + idx)
+
+        max_start = self.n_tokens - self.seq_len - 1
+        start = rng.integers(0, max(1, max_start))
+        tokens = self.data[start:start + self.seq_len].astype(np.int64)
+
+        input_ids = torch.from_numpy(tokens.copy())
+        labels = input_ids.clone()
+        return {"input_ids": input_ids, "labels": labels}
 
 
 class PreTokenizedTrainDataset(Dataset):
@@ -220,11 +273,28 @@ def create_train_dataloader(
     data_dir=None,
     dataset_name="monology/pile-uncopyrighted",
     seed=42,
+    pack_documents=False,
 ):
-    """Create training dataloader. Prefers doc-offset dataset, falls back to old format."""
+    """Create training dataloader. Prefers doc-offset dataset, falls back to old format.
+
+    Args:
+        pack_documents: If True, use PackedTrainDataset which reads contiguous
+            chunks from the full corpus (sequences may span document boundaries).
+            Recommended for long seq_len training where few documents exceed seq_len.
+    """
     if data_dir:
         train_bin = os.path.join(data_dir, "train.bin")
         offsets_file = os.path.join(data_dir, "train_offsets.npy")
+
+        if pack_documents and os.path.exists(train_bin):
+            print(f"Loading packed training data from {data_dir} (pack_documents=True)")
+            dataset = PackedTrainDataset(
+                train_bin, seq_len=seq_len, seed=seed,
+            )
+            return DataLoader(
+                dataset, batch_size=batch_size, shuffle=True,
+                num_workers=num_workers, pin_memory=True, drop_last=True,
+            )
 
         if os.path.exists(train_bin) and os.path.exists(offsets_file):
             print(f"Loading doc-offset training data from {data_dir}")
@@ -232,6 +302,7 @@ def create_train_dataloader(
             dataset = DocOffsetTrainDataset(
                 train_bin, offsets_file,
                 seq_len=seq_len, eos_token_id=eos_id, seed=seed,
+                min_doc_len=seq_len,
             )
             return DataLoader(
                 dataset, batch_size=batch_size, shuffle=True,

@@ -11,6 +11,7 @@ import argparse
 import json
 import math
 import os
+import signal
 import time
 from collections import defaultdict
 
@@ -149,6 +150,7 @@ def train(config: dict):
         data_dir=config.get("data_dir", None),
         dataset_name=config.get("dataset_name", "monology/pile-uncopyrighted"),
         seed=config.get("seed", 42),
+        pack_documents=config.get("pack_documents", False),
     )
 
     # Optimizer
@@ -198,6 +200,13 @@ def train(config: dict):
     log_interval = config.get("log_interval", 50)
     save_interval = config.get("save_interval", 5000)
     eval_interval = config.get("eval_interval", 2000)
+
+    preempt_requested = [False]
+    def _sigterm_handler(signum, frame):
+        print(f"\nSIGTERM received — will save checkpoint after current step")
+        preempt_requested[0] = True
+    signal.signal(signal.SIGTERM, _sigterm_handler)
+    signal.signal(signal.SIGUSR1, _sigterm_handler)
 
     running_loss = 0.0
     start_time = time.time()
@@ -280,6 +289,19 @@ def train(config: dict):
                 "tokens_seen": tokens_seen,
             }, save_path)
             print(f"Saved checkpoint to {save_path}")
+
+        if preempt_requested[0]:
+            save_path = os.path.join(config["output_dir"], f"checkpoint_{step}.pt")
+            torch.save({
+                "step": step,
+                "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "scheduler_state_dict": scheduler.state_dict(),
+                "config": config,
+                "tokens_seen": tokens_seen,
+            }, save_path)
+            print(f"Preemption checkpoint saved to {save_path} at step {step}")
+            break
 
     # Final save
     save_path = os.path.join(config["output_dir"], "checkpoint_final.pt")
