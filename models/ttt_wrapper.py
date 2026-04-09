@@ -193,13 +193,66 @@ class TTTWrapper(nn.Module):
 
         return y  # [B, T, d_inner]
 
-    def forward(self, u, source_embeddings, seq_idx=None):
+    def _apply_subspan(self, z_sub, deltaW, W0, W0_t, bias):
+        """Apply current DeltaW to a subspan of features."""
+        if self.use_residual_fast_path:
+            base_o = torch.bmm(z_sub.float(), W0_t)
+            fast_o = torch.bmm(z_sub.float(), deltaW.transpose(1, 2))
+            o = base_o + self.fast_gate * fast_o
+        else:
+            W_eff = W0.unsqueeze(0) + deltaW
+            o = torch.bmm(z_sub.float(), W_eff.transpose(1, 2))
+        if bias is not None:
+            o = o + bias.float().unsqueeze(0).unsqueeze(0)
+        return o
+
+    def _update_deltaW(self, z_sub, v_sub, deltaW, W0_norm, eta, decay):
+        """Compute update G from a subspan and update DeltaW."""
+        B = z_sub.shape[0]
+        span_len = z_sub.shape[1]
+        zc_fp32 = z_sub.float()
+        vc_fp32 = v_sub.float()
+
+        if self.normalize_update:
+            zc_u = rms_norm_lastdim(zc_fp32, eps=self.norm_eps)
+            vc_u = rms_norm_lastdim(vc_fp32, eps=self.norm_eps)
+        else:
+            zc_u = zc_fp32
+            vc_u = vc_fp32
+
+        G = torch.bmm(vc_u.transpose(1, 2), zc_u) / span_len
+
+        if self.clip_tau is not None:
+            G_norm = torch.norm(G.reshape(B, -1), dim=1, keepdim=True).unsqueeze(-1)
+            scale = torch.clamp(self.clip_tau / (G_norm + 1e-8), max=1.0)
+            G = G * scale
+
+        if self.g_rel_cap is not None:
+            G = project_fro_rel(G, base_norm=W0_norm, rho=self.g_rel_cap)
+
+        G_fro = torch.norm(G.reshape(B, -1), dim=1).mean().item()
+
+        if decay is not None:
+            if self.use_normalized_ema:
+                deltaW = decay * deltaW + (1.0 - decay) * eta * G
+            else:
+                deltaW = decay * deltaW + eta * G
+        else:
+            deltaW = deltaW + eta * G
+
+        if self.deltaW_rel_cap is not None:
+            deltaW = project_fro_rel(deltaW, base_norm=W0_norm, rho=self.deltaW_rel_cap)
+
+        return deltaW, G_fro
+
+    def forward(self, u, source_embeddings, segment_ids=None, seq_idx=None):
         """
-        TTT-enabled forward pass.
+        TTT-enabled forward pass with boundary-aware resets.
 
         Args:
             u: input to the Mamba2 block [B, T, d_model]
             source_embeddings: token embeddings for target building [B, T, d_model]
+            segment_ids: [B, T] document segment ids for boundary-aware reset (optional)
             seq_idx: optional sequence index for causal conv
 
         Returns:
@@ -210,9 +263,10 @@ class TTTWrapper(nn.Module):
         C = self.chunk_size
 
         z = self._get_pre_out_features(u, seq_idx=seq_idx)  # [B, T, d_inner]
-        vhat = self.target_builder(source_embeddings, chunk_size=C)  # [B, T, d_model]
+        vhat = self.target_builder(source_embeddings, chunk_size=C, segment_ids=segment_ids)  # [B, T, d_model]
 
         W0 = self.base_out_proj_weight.float()  # [d_model, d_inner]
+        W0_t = W0.unsqueeze(0).transpose(1, 2)  # [1, d_inner, d_model]
         bias = self.base_out_proj_bias
         W0_norm = W0.norm().detach()
 
@@ -223,80 +277,94 @@ class TTTWrapper(nn.Module):
 
         G_fro_accum = 0.0
         G_rel_accum = 0.0
-        n_chunks = 0
+        n_updates = 0
+        n_resets = 0
+        prev_seg_id = None
+        n_subspans_total = 0
+        n_chunks_with_boundary = 0
+        n_chunks_total = 0
 
         outputs = []
         for s in range(0, T, C):
             e = min(s + C, T)
-            chunk_len = e - s
 
-            zc = z[:, s:e, :]       # [B, chunk_len, d_inner]
-            vc = vhat[:, s:e, :]     # [B, chunk_len, d_model]
+            zc = z[:, s:e, :]
+            vc = vhat[:, s:e, :]
 
-            # Apply: O = Z @ (W_0 + DeltaW)^T  (spec eq. 5)
-            if self.use_residual_fast_path:
-                base_oc = torch.bmm(zc.float(), W0.unsqueeze(0).transpose(1, 2))
-                fast_oc = torch.bmm(zc.float(), deltaW.transpose(1, 2))
-                oc = base_oc + self.fast_gate * fast_oc
+            n_chunks_total += 1
+
+            if segment_ids is not None and B == 1:
+                seg_chunk = segment_ids[0, s:e]  # [chunk_len]
+                chunk_len = e - s
+
+                subspan_starts = [0]
+                for i in range(1, chunk_len):
+                    if seg_chunk[i].item() != seg_chunk[i - 1].item():
+                        subspan_starts.append(i)
+                subspan_starts.append(chunk_len)
+
+                n_subspans_in_chunk = len(subspan_starts) - 1
+                n_subspans_total += n_subspans_in_chunk
+                if n_subspans_in_chunk > 1:
+                    n_chunks_with_boundary += 1
+
+                chunk_outputs = []
+                for sp_idx in range(len(subspan_starts) - 1):
+                    sp_s = subspan_starts[sp_idx]
+                    sp_e = subspan_starts[sp_idx + 1]
+                    cur_seg_id = seg_chunk[sp_s].item()
+
+                    if prev_seg_id is not None and cur_seg_id != prev_seg_id:
+                        deltaW = torch.zeros_like(deltaW)
+                        n_resets += 1
+
+                    z_sub = zc[:, sp_s:sp_e, :]
+                    v_sub = vc[:, sp_s:sp_e, :]
+
+                    o_sub = self._apply_subspan(z_sub, deltaW, W0, W0_t, bias)
+                    chunk_outputs.append(o_sub.to(u.dtype))
+
+                    if sp_e - sp_s > 0:
+                        deltaW, g_fro = self._update_deltaW(z_sub, v_sub, deltaW, W0_norm, eta, decay)
+                        G_fro_accum += g_fro
+                        G_rel_accum += g_fro / (W0_norm.item() + 1e-8)
+                        n_updates += 1
+
+                    prev_seg_id = cur_seg_id
+
+                oc = torch.cat(chunk_outputs, dim=1)
+                outputs.append(oc)
             else:
-                W_eff = W0.unsqueeze(0) + deltaW  # [B, d_model, d_inner]
-                oc = torch.bmm(zc.float(), W_eff.transpose(1, 2))  # [B, chunk_len, d_model]
+                oc = self._apply_subspan(zc, deltaW, W0, W0_t, bias)
+                outputs.append(oc.to(u.dtype))
 
-            if bias is not None:
-                oc = oc + bias.float().unsqueeze(0).unsqueeze(0)
+                if e - s > 0:
+                    deltaW, g_fro = self._update_deltaW(zc, vc, deltaW, W0_norm, eta, decay)
+                    G_fro_accum += g_fro
+                    G_rel_accum += g_fro / (W0_norm.item() + 1e-8)
+                    n_updates += 1
 
-            outputs.append(oc.to(u.dtype))
-
-            # Update: normalized discounted rule (spec eq. 1-3)
-            zc_fp32 = zc.float()
-            vc_fp32 = vc.float()
-
-            if self.normalize_update:
-                zc_u = rms_norm_lastdim(zc_fp32, eps=self.norm_eps)
-                vc_u = rms_norm_lastdim(vc_fp32, eps=self.norm_eps)
-            else:
-                zc_u = zc_fp32
-                vc_u = vc_fp32
-
-            G = torch.bmm(vc_u.transpose(1, 2), zc_u) / chunk_len  # [B, d_model, d_inner]
-
-            if self.clip_tau is not None:
-                G_norm = torch.norm(G.reshape(B, -1), dim=1, keepdim=True).unsqueeze(-1)
-                scale = torch.clamp(self.clip_tau / (G_norm + 1e-8), max=1.0)
-                G = G * scale
-
-            if self.g_rel_cap is not None:
-                G = project_fro_rel(G, base_norm=W0_norm, rho=self.g_rel_cap)
-
-            G_fro = torch.norm(G.reshape(B, -1), dim=1).mean().item()
-            G_fro_accum += G_fro
-            G_rel_accum += G_fro / (W0_norm.item() + 1e-8)
-            n_chunks += 1
-
-            if decay is not None:
-                if self.use_normalized_ema:
-                    deltaW = decay * deltaW + (1.0 - decay) * eta * G
-                else:
-                    deltaW = decay * deltaW + eta * G
-            else:
-                deltaW = deltaW + eta * G
-
-            if self.deltaW_rel_cap is not None:
-                deltaW = project_fro_rel(deltaW, base_norm=W0_norm, rho=self.deltaW_rel_cap)
-
-        out = torch.cat(outputs, dim=1)  # [B, T, d_model]
+        out = torch.cat(outputs, dim=1)
 
         dW_fro = torch.norm(deltaW.reshape(B, -1), dim=1).mean().item()
-        self._last_diagnostics = {
+        diag = {
             "deltaW_fro_mean": dW_fro,
             "deltaW_rel_mean": dW_fro / (W0_norm.item() + 1e-8),
-            "G_fro_mean": G_fro_accum / max(n_chunks, 1),
-            "G_rel_mean": G_rel_accum / max(n_chunks, 1),
+            "G_fro_mean": G_fro_accum / max(n_updates, 1),
+            "G_rel_mean": G_rel_accum / max(n_updates, 1),
             "decay": decay.item() if decay is not None else 0.0,
             "effective_window_chunks": 1.0 / (1.0 - decay.item() + 1e-8) if decay is not None else float('inf'),
             "effective_window_tokens": C / (1.0 - decay.item() + 1e-8) if decay is not None else float('inf'),
             "inner_lr": eta.item(),
+            "n_resets": n_resets,
         }
+        if self.use_residual_fast_path:
+            diag["fast_gate"] = self.fast_gate.item()
+        if n_chunks_total > 0 and segment_ids is not None:
+            diag["n_doc_boundaries"] = n_resets
+            diag["frac_chunks_with_boundary"] = n_chunks_with_boundary / max(n_chunks_total, 1)
+            diag["avg_subspans_per_chunk"] = n_subspans_total / max(n_chunks_total, 1)
+        self._last_diagnostics = diag
 
         return out, deltaW
 
@@ -358,7 +426,7 @@ class TTTMamba2Block(nn.Module):
         self._last_deltaW = None
 
     def forward(self, hidden_states, residual=None, inference_params=None,
-                source_embeddings=None, **mixer_kwargs):
+                source_embeddings=None, segment_ids=None, **mixer_kwargs):
         """Forward with TTT. Requires source_embeddings to be passed through."""
         if not self.fused_add_norm:
             residual = (hidden_states + residual) if residual is not None else hidden_states
@@ -381,6 +449,7 @@ class TTTMamba2Block(nn.Module):
         assert source_embeddings is not None, "TTT blocks require source_embeddings"
         hidden_states, deltaW = self.ttt_wrapper(
             hidden_states, source_embeddings,
+            segment_ids=segment_ids,
             seq_idx=mixer_kwargs.get('seq_idx', None),
         )
 

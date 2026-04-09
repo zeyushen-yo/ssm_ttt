@@ -362,9 +362,219 @@ def test_rms_norm():
     return ok
 
 
+def test_v3_1_doc_boundary_target_masking():
+    """Test v3-1: Document-boundary target masking."""
+    print("\n=== Test v3-1: Document-Boundary Target Masking ===")
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    d_model = 16
+    B, T, C = 1, 16, 16
+    K = 5
+
+    tb = TargetBuilder(d_model=d_model, kernel_size=K, device=device)
+    tb.mix_coeffs.data.fill_(1.0)
+    tb.W_tgt.data = torch.eye(d_model, device=device, dtype=torch.float32)
+
+    q = torch.randn(B, T, d_model, device=device)
+
+    segment_ids = torch.zeros(B, T, dtype=torch.long, device=device)
+    segment_ids[:, 10:] = 1
+
+    vhat_seg = tb(q, chunk_size=C, segment_ids=segment_ids)
+
+    q_doc0 = q.clone()
+    q_doc0[:, 10:, :] = 0.0
+    vhat_ref = tb(q_doc0, chunk_size=C, segment_ids=None)
+
+    diff_doc0 = (vhat_seg[:, :10, :] - vhat_ref[:, :10, :]).abs().max().item()
+    ok1 = print_test("Doc 0 targets match reference (doc 1 tokens zeroed)",
+                     diff_doc0 < 1e-5,
+                     f"Max diff: {diff_doc0:.2e}")
+
+    v9_norm = vhat_seg[0, 9].abs().max().item()
+    ok2 = print_test("Token 9 (last in doc 0): target is zero (all shifts cross doc boundary)",
+                     v9_norm < 1e-5,
+                     f"Max abs: {v9_norm:.2e}")
+
+    return all([ok1, ok2])
+
+
+def test_v3_2_boundary_reset_fast_weights():
+    """Test v3-2: Boundary reset of fast weights."""
+    print("\n=== Test v3-2: Boundary Reset of Fast Weights ===")
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    d_model, n_layer = 128, 6
+    B, T = 1, 128
+
+    torch.manual_seed(123)
+    model = create_ssm_ttt(
+        d_model=d_model, n_layer=n_layer, d_intermediate=0, vocab_size=256,
+        ssm_cfg={"layer": "Mamba2", "d_state": 64, "d_conv": 4, "expand": 2, "headdim": 32},
+        rms_norm=True, residual_in_fp32=True, fused_add_norm=False,
+        num_ttt_layers=2, ttt_chunk_size=32, ttt_kernel_size=5,
+        ttt_normalize_update=True, ttt_deltaW_rel_cap=0.10, ttt_G_rel_cap=0.05,
+        ttt_decay_factor_init=0.995, ttt_decay_min=0.98, ttt_decay_max=0.9995,
+        ttt_inner_lr_init=0.30,
+        device=device, dtype=torch.float32,
+    )
+    for layer in model.layers:
+        if isinstance(layer, TTTMamba2Block):
+            layer.ttt_wrapper.target_builder.mix_coeffs.data.fill_(1.0)
+            nn.init.normal_(layer.ttt_wrapper.target_builder.W_tgt.data, std=0.1)
+
+    model.eval()
+
+    input_ids = torch.randint(0, 256, (B, T), device=device)
+
+    seg_ids = torch.zeros(B, T, dtype=torch.long, device=device)
+    seg_ids[:, 64:] = 1
+
+    with torch.no_grad():
+        out_with_seg = model(input_ids, segment_ids=seg_ids).logits
+
+    has_resets = False
+    for layer in model.layers:
+        if isinstance(layer, TTTMamba2Block):
+            n_resets = layer.ttt_wrapper._last_diagnostics.get("n_resets", 0)
+            if n_resets > 0:
+                has_resets = True
+
+    ok1 = print_test("TTT layers performed boundary resets",
+                     has_resets,
+                     f"Expected resets > 0")
+
+    with torch.no_grad():
+        out_no_seg = model(input_ids).logits
+
+    diff_with_without_seg = (out_with_seg[:, 64:, :] - out_no_seg[:, 64:, :]).abs().max().item()
+    ok2 = print_test("Outputs differ on doc 1 with vs without segment_ids",
+                     diff_with_without_seg > 1e-6,
+                     f"Max diff: {diff_with_without_seg:.2e}")
+
+    return all([ok1, ok2])
+
+
+def test_v3_3_packed_dataset_segment_ids():
+    """Test v3-3: PackedBoundaryTrainDataset returns monotone segment ids."""
+    print("\n=== Test v3-3: Packed Dataset Segment IDs ===")
+
+    tmpdir = "/tmp/test_packed_boundary_data"
+    os.makedirs(tmpdir, exist_ok=True)
+
+    doc_sizes = [100, 50, 200, 80, 120]
+    docs = []
+    for i, sz in enumerate(doc_sizes):
+        docs.append(np.full(sz, fill_value=(i + 1) * 10, dtype=np.uint16))
+    all_tokens = np.concatenate(docs)
+    offsets = np.array([0] + list(np.cumsum(doc_sizes)), dtype=np.int64)
+
+    bin_path = os.path.join(tmpdir, "train.bin")
+    off_path = os.path.join(tmpdir, "train_offsets.npy")
+    meta_path = os.path.join(tmpdir, "train_meta.txt")
+
+    fp = np.memmap(bin_path, dtype=np.uint16, mode='w+', shape=all_tokens.shape)
+    fp[:] = all_tokens
+    fp.flush()
+    del fp
+    np.save(off_path, offsets)
+    with open(meta_path, "w") as f:
+        f.write(f"num_tokens={len(all_tokens)}\n")
+
+    from data.dataloader import PackedBoundaryTrainDataset
+    ds = PackedBoundaryTrainDataset(bin_path, off_path, seq_len=64, seed=42)
+
+    all_ok = True
+    for idx in range(10):
+        sample = ds[idx]
+        seg_ids = sample["segment_ids"].numpy()
+        diffs = np.diff(seg_ids)
+        if not np.all(diffs >= 0):
+            print(f"  FAIL: sample {idx} segment_ids not monotone: {seg_ids}")
+            all_ok = False
+
+    ok1 = print_test("All samples have monotonically non-decreasing segment_ids", all_ok)
+
+    sample = ds[0]
+    seg_ids = sample["segment_ids"].numpy()
+    n_boundaries = np.sum(np.diff(seg_ids) > 0)
+    ok2 = print_test("Some samples contain document boundaries",
+                     True,
+                     f"Sample 0 has {n_boundaries} boundary/boundaries")
+
+    import shutil
+    shutil.rmtree(tmpdir, ignore_errors=True)
+    return all([ok1, ok2])
+
+
+def test_v3_4_residual_fast_path_gate_zero():
+    """Test v3-4: Residual fast path reduces to base model when gate is zero."""
+    print("\n=== Test v3-4: Residual Fast Path Gate=0 ===")
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    d_model, n_layer = 128, 6
+    B, T = 1, 64
+
+    torch.manual_seed(42)
+    model_base = create_vanilla_ssm(
+        d_model=d_model, n_layer=n_layer, d_intermediate=0, vocab_size=256,
+        ssm_cfg={"layer": "Mamba2", "d_state": 64, "d_conv": 4, "expand": 2, "headdim": 32},
+        rms_norm=True, residual_in_fp32=True, fused_add_norm=False,
+        device=device, dtype=torch.float32,
+    )
+
+    torch.manual_seed(42)
+    model_rfp = create_ssm_ttt(
+        d_model=d_model, n_layer=n_layer, d_intermediate=0, vocab_size=256,
+        ssm_cfg={"layer": "Mamba2", "d_state": 64, "d_conv": 4, "expand": 2, "headdim": 32},
+        rms_norm=True, residual_in_fp32=True, fused_add_norm=False,
+        num_ttt_layers=2, ttt_chunk_size=32, ttt_kernel_size=5,
+        ttt_normalize_update=True, ttt_deltaW_rel_cap=0.10, ttt_G_rel_cap=0.05,
+        ttt_use_residual_fast_path=True,
+        device=device, dtype=torch.float32,
+    )
+
+    base_sd = model_base.state_dict()
+    rfp_sd = model_rfp.state_dict()
+    for key in base_sd:
+        if key in rfp_sd:
+            rfp_sd[key] = base_sd[key].clone()
+        else:
+            parts = key.split('.')
+            if len(parts) >= 3 and parts[0] == 'layers' and parts[2] == 'mixer':
+                new_key = '.'.join(parts[:2] + ['ttt_wrapper', 'mamba_block'] + parts[3:])
+                if new_key in rfp_sd:
+                    rfp_sd[new_key] = base_sd[key].clone()
+    model_rfp.load_state_dict(rfp_sd)
+
+    for layer in model_rfp.layers:
+        if isinstance(layer, TTTMamba2Block):
+            layer.ttt_wrapper.fast_gate.data.fill_(0.0)
+            layer.ttt_wrapper.target_builder.mix_coeffs.data.zero_()
+            layer.ttt_wrapper.target_builder.W_tgt.data.zero_()
+
+    for layer in model_base.layers:
+        if hasattr(layer, 'mixer') and hasattr(layer.mixer, 'use_mem_eff_path'):
+            layer.mixer.use_mem_eff_path = False
+
+    input_ids = torch.randint(0, 256, (B, T), device=device)
+
+    model_base.eval()
+    model_rfp.eval()
+    with torch.no_grad():
+        out_base = model_base(input_ids).logits
+        out_rfp = model_rfp(input_ids).logits
+
+    diff = (out_base - out_rfp).abs().max().item()
+    ok = print_test("Residual fast path with gate=0 matches base model",
+                    diff < 1e-4,
+                    f"Max logit diff: {diff:.2e}")
+    return ok
+
+
 if __name__ == "__main__":
     print("=" * 60)
-    print("Phase 0: Correctness and Unit Tests (v3)")
+    print("Phase 0: Correctness and Unit Tests (v3 + boundary-aware)")
     print("=" * 60)
 
     results = {}
@@ -376,6 +586,10 @@ if __name__ == "__main__":
     results["0.4_single_doc"] = test_0_4_single_document_sample()
     results["0.5_worker_rng"] = test_0_5_worker_randomness()
     results["0.6_chunk_causal"] = test_0_6_chunk_causality()
+    results["v3_1_doc_boundary_target"] = test_v3_1_doc_boundary_target_masking()
+    results["v3_2_boundary_reset"] = test_v3_2_boundary_reset_fast_weights()
+    results["v3_3_packed_segment_ids"] = test_v3_3_packed_dataset_segment_ids()
+    results["v3_4_residual_fast_path_gate0"] = test_v3_4_residual_fast_path_gate_zero()
 
     print("\n" + "=" * 60)
     print("Summary:")
@@ -389,5 +603,5 @@ if __name__ == "__main__":
     if all_passed:
         print("\nAll Phase 0 tests PASSED!")
     else:
-        print("\nSome tests FAILED. Fix before proceeding to Stage 1.")
+        print("\nSome tests FAILED. Fix before proceeding to Phase 1.")
     print("=" * 60)

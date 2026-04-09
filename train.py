@@ -51,29 +51,46 @@ def get_model(config: dict, device="cuda", dtype=torch.bfloat16):
 
 
 def get_optimizer(model, config: dict):
-    """Set up AdamW optimizer with weight decay exclusions."""
+    """Set up AdamW optimizer with 4 parameter groups per spec v3."""
     lr = config.get("lr", 5e-4)
     weight_decay = config.get("weight_decay", 0.1)
     betas = tuple(config.get("betas", [0.9, 0.95]))
+    ttt_target_lr_mult = config.get("ttt_target_lr_mult", 3.0)
 
-    # Separate parameters: no weight decay on biases, norms, embeddings, TTT-specific params
-    decay_params = []
-    no_decay_params = []
+    group_a = []  # backbone decayed (matrix weights)
+    group_b = []  # backbone no decay (biases, norms, embeddings, scalars)
+    group_c = []  # TTT target-builder params (mix_coeffs, W_tgt)
+    group_d = []  # TTT scalar control params (log_inner_lr, log_decay_logit, fast_gate)
+
+    ttt_target_names = {"mix_coeffs", "W_tgt"}
+    ttt_scalar_names = {"log_inner_lr", "log_decay_logit", "fast_gate"}
+
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
-        if param.ndim <= 1 or "bias" in name or "norm" in name or "embedding" in name:
-            no_decay_params.append(param)
-        elif "mix_coeffs" in name or "W_tgt" in name:
-            # TTT target builder params - may want different lr later
-            decay_params.append(param)
+        leaf_name = name.split(".")[-1]
+        if leaf_name in ttt_target_names:
+            group_c.append(param)
+        elif leaf_name in ttt_scalar_names:
+            group_d.append(param)
+        elif param.ndim <= 1 or "bias" in name or "norm" in name or "embedding" in name:
+            group_b.append(param)
         else:
-            decay_params.append(param)
+            group_a.append(param)
 
     param_groups = [
-        {"params": decay_params, "weight_decay": weight_decay},
-        {"params": no_decay_params, "weight_decay": 0.0},
+        {"params": group_a, "weight_decay": weight_decay, "lr": lr},
+        {"params": group_b, "weight_decay": 0.0, "lr": lr},
+        {"params": group_c, "weight_decay": 0.0, "lr": lr * ttt_target_lr_mult},
+        {"params": group_d, "weight_decay": 0.0, "lr": lr},
     ]
+
+    n_a = sum(p.numel() for p in group_a)
+    n_b = sum(p.numel() for p in group_b)
+    n_c = sum(p.numel() for p in group_c)
+    n_d = sum(p.numel() for p in group_d)
+    print(f"Optimizer groups: A(backbone-decay)={n_a:,} B(backbone-nodecay)={n_b:,} "
+          f"C(ttt-target, lr={lr*ttt_target_lr_mult:.1e})={n_c:,} D(ttt-scalar)={n_d:,}")
 
     optimizer = torch.optim.AdamW(param_groups, lr=lr, betas=betas)
     return optimizer
@@ -151,6 +168,7 @@ def train(config: dict):
         dataset_name=config.get("dataset_name", "monology/pile-uncopyrighted"),
         seed=config.get("seed", 42),
         pack_documents=config.get("pack_documents", False),
+        boundary_aware=config.get("boundary_aware", False),
     )
 
     # Optimizer
@@ -221,11 +239,14 @@ def train(config: dict):
 
         input_ids = batch["input_ids"].to(device)
         labels = batch["labels"].to(device)
+        segment_ids = batch.get("segment_ids", None)
+        if segment_ids is not None:
+            segment_ids = segment_ids.to(device)
 
         optimizer.zero_grad(set_to_none=True)
 
         with torch.autocast(device_type="cuda", dtype=dtype, enabled=use_amp):
-            output = model(input_ids, labels=labels)
+            output = model(input_ids, labels=labels, segment_ids=segment_ids)
             loss = output.loss
 
         if torch.isnan(loss) or torch.isinf(loss):
@@ -291,6 +312,8 @@ def train(config: dict):
             print(f"Saved checkpoint to {save_path}")
 
         if preempt_requested[0]:
+            signal.signal(signal.SIGTERM, signal.SIG_IGN)
+            signal.signal(signal.SIGUSR1, signal.SIG_IGN)
             save_path = os.path.join(config["output_dir"], f"checkpoint_{step}.pt")
             torch.save({
                 "step": step,
@@ -301,7 +324,7 @@ def train(config: dict):
                 "tokens_seen": tokens_seen,
             }, save_path)
             print(f"Preemption checkpoint saved to {save_path} at step {step}")
-            break
+            sys.exit(0)
 
     # Final save
     save_path = os.path.join(config["output_dir"], "checkpoint_final.pt")

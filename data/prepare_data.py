@@ -178,7 +178,7 @@ def prepare_val_data(tokenizer, output_dir, max_docs=200, min_doc_len=32768,
         tokens = tokenizer.encode(text, add_special_tokens=False)
 
         if len(tokens) >= min_doc_len:
-            tokens = tokens[:65536]
+            tokens = tokens[:131072]
             all_tokens.extend(tokens)
             offsets.append(len(all_tokens))
             count += 1

@@ -33,13 +33,14 @@ class TargetBuilder(nn.Module):
         w_tgt.diagonal().copy_(diag_vals)
         self.W_tgt = nn.Parameter(w_tgt)
 
-    def forward(self, q: torch.Tensor, chunk_size: int) -> torch.Tensor:
+    def forward(self, q: torch.Tensor, chunk_size: int, segment_ids=None) -> torch.Tensor:
         """
         Build targets for all positions.
 
         Args:
             q: source sequence [B, T, d] (token embeddings for from-scratch track)
             chunk_size: chunk size C for boundary masking
+            segment_ids: [B, T] document segment ids for boundary-aware masking (optional)
 
         Returns:
             vhat: [B, T, d] target directions
@@ -47,33 +48,36 @@ class TargetBuilder(nn.Module):
         B, T, d = q.shape
         q_fp32 = q.float()
 
-        # Build shifted versions with within-chunk boundary zeroing
-        # For each offset j in 1..K, create q_{t+j} with zeros at chunk boundaries
         u = torch.zeros(B, T, d, device=q.device, dtype=torch.float32)
+
+        pos = torch.arange(T, device=q.device)
+        chunk_of_t = pos // chunk_size
 
         for j in range(1, self.kernel_size + 1):
             if j >= T:
                 break
 
-            # Shift q left by j positions: q_shifted[t] = q[t+j]
             q_shifted = torch.zeros_like(q_fp32)
             q_shifted[:, :T - j, :] = q_fp32[:, j:, :]
 
-            # Zero out positions where t+j crosses a chunk boundary
-            # Position t is in chunk t // C. Position t+j is in chunk (t+j) // C.
-            # If they differ, zero it out.
-            pos = torch.arange(T, device=q.device)
-            chunk_of_t = pos // chunk_size
             chunk_of_tj = torch.clamp(pos + j, max=T - 1) // chunk_size
-            # Also zero where t+j >= T
-            cross_boundary = (chunk_of_t != chunk_of_tj) | (pos + j >= T)
-            # cross_boundary: [T] bool mask
-            q_shifted[:, cross_boundary, :] = 0.0
+            cross_chunk = (chunk_of_t != chunk_of_tj)
+            cross_end = (pos + j >= T)
+            cross_boundary = cross_chunk | cross_end  # [T]
 
-            # Elementwise multiply with d_j and accumulate
+            if segment_ids is not None:
+                seg_t = segment_ids[:, :]  # [B, T]
+                seg_tj = torch.zeros_like(seg_t)
+                seg_tj[:, :T - j] = segment_ids[:, j:]
+                seg_tj[:, T - j:] = -1
+                cross_doc = (seg_t != seg_tj)  # [B, T]
+                cross_boundary_full = cross_boundary.unsqueeze(0) | cross_doc  # [B, T]
+                q_shifted = q_shifted.masked_fill(cross_boundary_full.unsqueeze(-1), 0.0)
+            else:
+                q_shifted[:, cross_boundary, :] = 0.0
+
             u = u + self.mix_coeffs[j - 1].unsqueeze(0).unsqueeze(0) * q_shifted
 
-        # Apply projection: vhat = u @ W_tgt^T -> [B, T, d]
         vhat = torch.matmul(u, self.W_tgt.t())
 
         return vhat

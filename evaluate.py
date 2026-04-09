@@ -33,7 +33,7 @@ from models.swa_transformer import SWATransformerLM
 from models.ttt_wrapper import TTTMamba2Block
 
 
-CONTEXT_LENGTHS = [2048, 4096, 8192, 16384, 32768]
+CONTEXT_LENGTHS = [2048, 4096, 8192, 16384, 32768, 65536, 131072]
 
 
 def load_val_documents(data_dir, min_len=2048):
@@ -84,7 +84,7 @@ def load_model_from_checkpoint(checkpoint_path, device="cuda"):
 
 
 def collect_ttt_eval_diagnostics(model):
-    """Collect per-layer deltaW diagnostics during evaluation."""
+    """Collect per-layer TTT diagnostics during evaluation (spec v3 diagnostics)."""
     diagnostics = {}
     if not isinstance(model, SSMTTTModel):
         return diagnostics
@@ -95,8 +95,26 @@ def collect_ttt_eval_diagnostics(model):
             if diag:
                 diagnostics[f"layer_{i}/deltaW_rel_mean"] = diag.get("deltaW_rel_mean", 0.0)
                 diagnostics[f"layer_{i}/deltaW_fro_mean"] = diag.get("deltaW_fro_mean", 0.0)
+                diagnostics[f"layer_{i}/G_rel_mean"] = diag.get("G_rel_mean", 0.0)
                 diagnostics[f"layer_{i}/decay"] = diag.get("decay", 0.0)
+                diagnostics[f"layer_{i}/effective_window_tokens"] = diag.get("effective_window_tokens", 0.0)
                 diagnostics[f"layer_{i}/inner_lr"] = diag.get("inner_lr", 0.0)
+                if "fast_gate" in diag:
+                    diagnostics[f"layer_{i}/fast_gate"] = diag["fast_gate"]
+                diagnostics[f"layer_{i}/n_resets"] = diag.get("n_resets", 0)
+                if "frac_chunks_with_boundary" in diag:
+                    diagnostics[f"layer_{i}/frac_chunks_with_boundary"] = diag["frac_chunks_with_boundary"]
+                    diagnostics[f"layer_{i}/avg_subspans_per_chunk"] = diag["avg_subspans_per_chunk"]
+            tb = wrapper.target_builder
+            mix_norm = tb.mix_coeffs.data.norm().item()
+            diagnostics[f"layer_{i}/mix_coeffs_norm"] = mix_norm
+            wtgt = tb.W_tgt.data.float()
+            diag_norm = wtgt.diagonal().norm().item()
+            off_diag = wtgt.clone()
+            off_diag.fill_diagonal_(0.0)
+            off_diag_norm = off_diag.norm().item()
+            diagnostics[f"layer_{i}/W_tgt_diag_norm"] = diag_norm
+            diagnostics[f"layer_{i}/W_tgt_offdiag_norm"] = off_diag_norm
             if layer._last_deltaW is not None:
                 dW = layer._last_deltaW
                 W0_norm = wrapper.base_out_proj_weight.float().norm().item()
@@ -190,8 +208,12 @@ def evaluate_sliding_window_ppl(
         diag_str = ""
         if L in ttt_diag_by_ctx:
             rel_means = {k: v for k, v in ttt_diag_by_ctx[L].items() if "deltaW_rel_mean" in k}
+            eff_windows = {k: v for k, v in ttt_diag_by_ctx[L].items() if "effective_window_tokens" in k}
             if rel_means:
                 diag_str = " | " + " ".join(f"{k.split('/')[0]}={v:.4f}" for k, v in sorted(rel_means.items()))
+            if eff_windows:
+                first_ew = list(eff_windows.values())[0]
+                diag_str += f" | eff_window={first_ew:.0f}tok"
 
         print(f"  Context {L:>6} ({L//1024:>2}k): PPL = {ppl:8.2f}  "
               f"(n_docs={n_docs}, avg_nll={avg_nll:.4f}){diag_str}")
@@ -297,7 +319,14 @@ if __name__ == "__main__":
                 diag = diag_by_ctx[L]
                 rel_means = {k: v for k, v in sorted(diag.items()) if "deltaW_rel_mean" in k}
                 parts = " ".join(f"{k.split('/')[0]}={v:.4f}" for k, v in rel_means.items())
-                print(f"    {L//1024}k: {parts}")
+                eff_w = [v for k, v in diag.items() if "effective_window_tokens" in k]
+                fg = [v for k, v in diag.items() if "fast_gate" in k]
+                extra = ""
+                if eff_w:
+                    extra += f" | eff_window={eff_w[0]:.0f}tok"
+                if fg:
+                    extra += f" | fast_gate={fg[0]:.4f}"
+                print(f"    {L//1024}k: {parts}{extra}")
 
     results_path = args.output.replace(".png", "_results.json")
     save_data = {

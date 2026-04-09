@@ -1,16 +1,17 @@
 #!/bin/bash
-#SBATCH --job-name=phase1
+#SBATCH --job-name=s2_ttt
 #SBATCH --account=henderson
-#SBATCH --time=00:59:00
+#SBATCH --partition=ailab
+#SBATCH --time=23:59:00
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=16
+#SBATCH --cpus-per-task=8
 #SBATCH --mem=128G
-#SBATCH --gres=gpu:a100:1
+#SBATCH --gres=gpu:1
 #SBATCH --signal=B:USR1@120
-#SBATCH --output=/scratch/gpfs/HENDERSON/zs7353/ssm_ttt/runs/phase1_%j_%x.out
+#SBATCH --output=/scratch/gpfs/HENDERSON/zs7353/ssm_ttt/runs/%j_%x.out
 
-# Usage: sbatch --export=CONFIG=configs/phase1_B.yaml --job-name=phase1_B scripts/run_phase1_all.sh
+# Usage: sbatch --export=CONFIG=configs/s2_decay.yaml --job-name=s2_decay scripts/run_ailab.sh
 
 module load anaconda3/2025.12
 module load cudatoolkit/12.6

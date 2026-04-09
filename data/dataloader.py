@@ -151,6 +151,60 @@ class PackedTrainDataset(Dataset):
         return {"input_ids": input_ids, "labels": labels}
 
 
+class PackedBoundaryTrainDataset(Dataset):
+    """
+    Boundary-aware packed training dataset for TTT.
+    Returns segment_ids alongside input_ids/labels so TTT can reset
+    fast weights and mask targets at document boundaries.
+
+    Uses np.searchsorted on train_offsets.npy to map each token
+    position to its document index.
+    """
+
+    def __init__(self, data_path, offsets_path, seq_len=32768, seed=42):
+        self.seq_len = seq_len
+        self.seed = seed
+        self.data = np.memmap(data_path, dtype=np.uint16, mode='r')
+        self.offsets = np.load(offsets_path)
+
+        meta_path = data_path.replace('.bin', '_meta.txt')
+        if os.path.exists(meta_path):
+            with open(meta_path) as f:
+                for line in f:
+                    if line.startswith("num_tokens="):
+                        self.n_tokens = int(line.strip().split("=")[1])
+                        break
+                else:
+                    self.n_tokens = len(self.data)
+        else:
+            self.n_tokens = len(self.data)
+
+        print(f"PackedBoundaryTrainDataset: {self.n_tokens:,} tokens, "
+              f"{len(self.offsets)-1} docs, seq_len={seq_len}")
+        self._len = self.n_tokens // seq_len
+
+    def __len__(self):
+        return self._len
+
+    def __getitem__(self, idx):
+        worker_info = torch.utils.data.get_worker_info()
+        worker_id = 0 if worker_info is None else worker_info.id
+        rng = np.random.default_rng(self.seed + 1000003 * worker_id + idx)
+
+        max_start = self.n_tokens - self.seq_len - 1
+        start = rng.integers(0, max(1, max_start))
+        tokens = self.data[start:start + self.seq_len].astype(np.int64)
+
+        positions = np.arange(start, start + self.seq_len, dtype=np.int64)
+        doc_ids = np.searchsorted(self.offsets, positions, side="right") - 1
+        doc_ids_local = doc_ids - doc_ids[0]
+
+        input_ids = torch.from_numpy(tokens.copy())
+        labels = input_ids.clone()
+        segment_ids = torch.from_numpy(doc_ids_local.astype(np.int64))
+        return {"input_ids": input_ids, "labels": labels, "segment_ids": segment_ids}
+
+
 class PreTokenizedTrainDataset(Dataset):
     """
     Fallback dataset for data_cache without train_offsets.npy.
@@ -274,6 +328,7 @@ def create_train_dataloader(
     dataset_name="monology/pile-uncopyrighted",
     seed=42,
     pack_documents=False,
+    boundary_aware=False,
 ):
     """Create training dataloader. Prefers doc-offset dataset, falls back to old format.
 
@@ -287,10 +342,16 @@ def create_train_dataloader(
         offsets_file = os.path.join(data_dir, "train_offsets.npy")
 
         if pack_documents and os.path.exists(train_bin):
-            print(f"Loading packed training data from {data_dir} (pack_documents=True)")
-            dataset = PackedTrainDataset(
-                train_bin, seq_len=seq_len, seed=seed,
-            )
+            if boundary_aware and os.path.exists(offsets_file):
+                print(f"Loading boundary-aware packed data from {data_dir} (pack_documents=True, boundary_aware=True)")
+                dataset = PackedBoundaryTrainDataset(
+                    train_bin, offsets_file, seq_len=seq_len, seed=seed,
+                )
+            else:
+                print(f"Loading packed training data from {data_dir} (pack_documents=True, boundary_aware=False)")
+                dataset = PackedTrainDataset(
+                    train_bin, seq_len=seq_len, seed=seed,
+                )
             return DataLoader(
                 dataset, batch_size=batch_size, shuffle=True,
                 num_workers=num_workers, pin_memory=True, drop_last=True,

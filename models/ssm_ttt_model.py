@@ -243,11 +243,12 @@ class SSMTTTModel(nn.Module):
             )
         )
 
-    def forward(self, input_ids, labels=None, **kwargs):
+    def forward(self, input_ids, labels=None, segment_ids=None, **kwargs):
         """
         Args:
             input_ids: [B, T] token ids
             labels: [B, T] labels for loss computation (shifted internally)
+            segment_ids: [B, T] document segment ids for TTT boundary handling (optional)
 
         Returns:
             CausalLMOutput with logits and optional loss
@@ -278,6 +279,7 @@ class SSMTTTModel(nn.Module):
                 hidden_states, residual = layer(
                     hidden_states, residual,
                     source_embeddings=src,
+                    segment_ids=segment_ids,
                 )
             else:
                 hidden_states, residual = layer(

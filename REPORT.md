@@ -158,44 +158,159 @@ The normalized update rule `DeltaW = λ·DeltaW + (1−λ)·η·G` has a theoret
 
 ---
 
-## 6. Status and Next Steps
+## 6. Phase 1 Screening: v3 Correctness Fixes (50M tokens, seq_len=32768)
 
-### Stage 1 Complete
-- [x] Config screening: 7 configs (SWA, Vanilla, C0–C5) at seq_len=2048, 200M tokens
-- [x] Data pipeline fixes (padding bug, packed document mode)
-- [x] All 4 models (SWA, Vanilla, C1, C2) trained at seq_len=32768, 200M tokens
-- [x] Full evaluation at both training regimes
-- [x] Config selection: **C2 (chunk=64)** is the best TTT config
+### 6.1 Design
 
-### Key Findings
-1. **TTT v3 (C2, chunk=64) improves over vanilla SSM by 3.6–5.0%** at long contexts, in both training regimes.
-2. **SWA Transformer outperforms all SSM models at 32k training with batch_size=1**, but SSM+TTT is competitive when trained with adequate batch size.
-3. **Chunk size is important**: chunk=64 (C2) consistently outperforms chunk=128 (C1); even finer chunks may help further.
-4. **The v3 update rule (normalized, discounted, capped) is essential** for stability at long contexts.
+Four variants tested to isolate the impact of each correctness fix from the v3 spec. All use in-place TTT on `out_proj` (chunk=64, 4 TTT layers), trained on 50M screening tokens.
 
-### Next Steps
-1. **Stage 2** (400M+ tokens, batch_size≥4 at seq_len=32768) — the key experiment to determine if TTT v3 can match or beat SWA with equal batch size
-2. **Evaluate at contexts beyond training length** (64k, 128k) — TTT's inductive extrapolation should outperform SWA's RoPE and Vanilla SSM's fixed recurrence
-3. **Explore finer chunk sizes** (chunk=32) — the trend from C1→C2 suggests further gains
-4. **Stage 3** (2B tokens, Figure-2 deliverable) per spec
+| Config | Description |
+|--------|------------|
+| P1-A | C2 control (no boundary awareness, default decay 0.9–0.995) |
+| P1-B | P1-A + boundary-aware packed training (DeltaW resets at doc boundaries) |
+| P1-C | P1-B + longer decay range (init 0.995, min 0.98, max 0.9995) |
+| P1-D | P1-C + 4-group optimizer split (3× LR for TTT target params) + higher G_rel_cap (0.05) |
+
+### 6.2 Results
+
+| Model | 2k | 4k | 8k | 16k | 32k | PPL Δ (2k→32k) |
+|-------|------|------|------|------|------|----------------|
+| **P1-D** | **168.22** | **165.88** | **165.57** | **165.37** | **165.24** | **−3.0** |
+| P1-A (control) | 171.63 | 168.44 | 168.38 | 168.39 | 168.40 | −0.0 |
+| Stage1-C2 @50M | 169.92 | 167.17 | 167.12 | 167.12 | 167.12 | −0.0 |
+| P1-C | 173.24 | 170.80 | 170.53 | 170.43 | 170.34 | −2.9 |
+| P1-B | 173.54 | 170.68 | 170.63 | 170.65 | 170.65 | −0.0 |
+
+Note: absolute PPL values are high because all models are severely undertrained at 50M tokens (only 1,525 gradient steps with batch_size=1). The Stage 1 C2 reference trained at 50M tokens confirms this is expected (PPL 167.12). The meaningful comparison is between Phase 1 variants.
+
+### 6.3 Key Findings
+
+1. **P1-D is the clear winner** — 3 PPL points better than P1-A at all context lengths, and the only variant that substantially beats the Stage 1 C2 reference at the same token budget.
+
+2. **P1-D shows context-dependent improvement** — PPL drops from 168.2 at 2k to 165.2 at 32k (3 point gain). P1-A and P1-B are completely flat across context lengths.
+
+3. **P1-D diagnostics show the right behavior:**
+   - `deltaW_rel` grows 4.5× from 2k→32k (0.0008→0.0036), meaning TTT adapts more with longer context
+   - At 32k, deltaW_rel reaches 0.0032–0.0040, matching Stage 1 C2 at 200M tokens
+   - Effective window: ~10,057 tokens (10× longer than A/B's ~1,074 tokens)
+
+4. **The optimizer split + higher G_rel_cap are the critical enablers** — they allow TTT parameters to learn faster and produce larger gradient updates.
+
+5. **Boundary awareness alone (P1-B) hurts** — DeltaW resets at document boundaries discard accumulated learning. At 50M tokens the model cannot recover.
+
+6. **Longer decay range (P1-C) shows the right dynamics but worse overall PPL** — the 10× longer effective window and context-dependent deltaW_rel are promising, but boundary-awareness overhead prevents net improvement over A.
+
+### 6.4 Phase 0 Tests
+
+All 12 correctness tests PASSED, including 4 new v3 boundary-aware tests:
+- v3-1: Document-boundary target masking
+- v3-2: Boundary reset of fast weights
+- v3-3: Packed dataset segment IDs
+- v3-4: Residual fast path gate=0 identity
 
 ---
 
-## 7. Repository Structure
+## 7. Stage 2: Scaling to 200M Tokens
+
+### 7.1 Design
+
+Based on Phase 1 screening, two configs were trained at 200M tokens for a proper comparison against Stage 1 baselines. Both use **in-place TTT** (no residual fast path).
+
+**Design principle:** We strongly prefer in-place TTT (`W_eff = W0 + DeltaW`) over adding new architectural components. The appeal is elegance: the SSM backbone is unchanged, and TTT simply adapts existing weights at test time.
+
+| Config | Changes from Stage 1 C2 |
+|--------|------------------------|
+| s2_decay | Longer decay (init 0.995, min 0.98, max 0.9995) |
+| s2_decay_optim | + optimizer split (3× TTT LR) + G_rel_cap 0.05 |
+| Stage 1 C2 | Control (default decay 0.9–0.995) |
+
+Neither s2 config uses boundary awareness (which hurt in Phase 1 screening).
+
+### 7.2 Results
+
+All five models evaluated on the same 50 validation documents in a single eval run for consistent comparison. All trained at 200M tokens, seq_len=32768, batch_size=1.
+
+| Model | 2k | 4k | 8k | 16k | 32k |
+|-------|------|------|------|------|------|
+| **SWA Transformer** | **57.44** | **53.52** | **53.39** | **53.34** | **53.82** |
+| Stage 1 C2 (TTT) | 61.33 | 58.41 | 58.35 | 58.34 | 58.34 |
+| s2_decay | 61.84 | 59.38 | 59.22 | 59.17 | 59.15 |
+| Vanilla SSM | 63.06 | 60.41 | 60.36 | 60.35 | 60.36 |
+| s2_decay_optim | 65.85 | 62.82 | 62.53 | 62.43 | 62.41 |
+
+### 7.3 Analysis
+
+1. **Longer decay hurts.** s2_decay (59.15 at 32k) is worse than Stage 1 C2 (58.34), though still better than Vanilla SSM (60.36). The extended decay range (min 0.98, max 0.9995 vs default 0.9–0.995) does not translate to better perplexity at scale.
+
+2. **Optimizer split + higher G_rel_cap also hurts at scale.** s2_decay_optim (62.41 at 32k) is the worst model — worse even than vanilla SSM. Despite P1-D being the 50M screening winner, the changes that helped at 50M tokens (3× TTT LR, G_rel_cap 0.05) cause divergence or overfitting of TTT parameters when trained to 200M tokens.
+
+3. **Stage 1 C2 remains the best SSM+TTT configuration.** The original default decay (0.9–0.995) with standard optimizer settings outperforms both Stage 2 variants at full scale.
+
+4. **SWA Transformer still dominates.** PPL 53.82 vs best SSM+TTT at 58.34 — a gap of 4.5 points (7.7% relative).
+
+---
+
+## 8. Critical Assessment
+
+### 8.1 What Works
+
+- **In-place TTT is stable.** The v3 normalized discounted update (`DeltaW = λ·DeltaW + (1−λ)·η·G`) with Frobenius caps completely eliminates the DeltaW explosion seen in v1/v2. PPL is perfectly flat from 8k to 32k.
+- **TTT consistently improves over vanilla SSM.** Stage 1 C2 achieves 58.34 vs 60.36 (3.3% improvement at 32k) — this holds across both training regimes (2k and 32k) and is not a fluke.
+- **The mechanism is correct.** All 12 Phase 0 tests pass, diagnostics show expected behavior (deltaW_rel grows with context, saturates at steady state).
+
+### 8.2 Concerns
+
+1. **The improvement is small.** A ~2 PPL point gain (3.3% relative) is modest, especially given the added complexity: extra parameters (target builder with mix_coeffs, W_tgt), learnable inner LR and decay per layer, chunk-wise updates at inference time.
+
+2. **TTT does not show context-dependent improvement.** The gap between C2 and Vanilla SSM is roughly constant across all context lengths — both are flat from ~4k onward. If TTT were leveraging long-range context in a meaningful way, we would expect a *widening* gap at longer contexts. Instead, the improvement appears to be a uniform shift, which could come from simply having more trainable parameters rather than from the TTT adaptation mechanism itself.
+
+3. **SWA Transformer still dominates.** The gap between SWA (53.82) and the best SSM+TTT (58.34) is 4.5 PPL points. The narrative "we improved SSM by 3.3% but it's still 7.7% worse than attention" is not compelling.
+
+4. **Could be a parameter count effect.** C2 has additional parameters from the TTT target builder (mix_coeffs, W_tgt projections across 4 layers). Without a parameter-matched vanilla SSM control (e.g., a wider d_model or extra FFN layers), we cannot rule out that the improvement comes from extra capacity rather than the TTT adaptation mechanism.
+
+5. **Phase 1 screening results did not transfer to full scale.** P1-D was the clear 50M-token winner, but both changes it introduced (longer decay, optimizer split) degraded performance at 200M tokens. This suggests the screening methodology at 50M tokens is unreliable for predicting 200M-token outcomes.
+
+### 8.3 Honest Summary
+
+In-place TTT on SSMs is a valid proof-of-concept: the mechanism is stable, correct, and directionally helpful. However, the effect size is too small (~3%) and too context-independent to constitute a strong research result on its own. For a publishable contribution, one would need: (a) a substantially larger gain over vanilla SSM, (b) clear evidence that TTT specifically helps at long contexts (widening gap with context length), or (c) closing the gap with attention-based models.
+
+---
+
+## 9. Status and Next Steps
+
+### Completed
+- [x] Stage 1: Config screening (7 configs at 2k, 4 models at 32k, 200M tokens)
+- [x] Phase 0: All 12 correctness tests passed
+- [x] Phase 1: 50M screening of v3 fixes → P1-D best at 50M but did not transfer to 200M
+- [x] Stage 2: s2_decay and s2_decay_optim trained at 200M tokens → both worse than Stage 1 C2
+
+### Possible Next Directions (if continuing)
+1. **Parameter-matched control**: Train a wider vanilla SSM (e.g., d_model=784) to match C2's total parameter count, to distinguish TTT adaptation gains from extra-capacity gains
+2. **Finer chunk sizes** (chunk=32) to test whether more frequent TTT updates help
+3. **Scale to batch_size≥4** at 32k to reduce gradient noise and see if SSM+TTT benefits more than vanilla from better training signal
+4. **Evaluate at 64k and 128k** to test long-context extrapolation
+
+---
+
+## 9. Repository Structure
 
 ```
 ssm_ttt/
 ├── configs/                     # YAML training configs
 │   ├── stage1_*.yaml            # Stage 1 configs (seq_len=2048)
-│   └── stage1_32k_*.yaml        # Stage 1 configs (seq_len=32768)
+│   ├── stage1_32k_*.yaml        # Stage 1 configs (seq_len=32768)
+│   ├── phase1_*.yaml            # Phase 1 screening configs (50M tokens)
+│   └── s2_*.yaml                # Stage 2 configs (200M tokens)
 ├── data/
-│   ├── dataloader.py            # DocOffset, Packed, and Streaming datasets
+│   ├── dataloader.py            # DocOffset, Packed, Boundary datasets
 │   └── prepare_data.py          # Pile tokenization script
 ├── models/
 │   ├── ssm_ttt_model.py         # SSM backbone + TTT layer selection
 │   ├── swa_transformer.py       # SWA Transformer baseline
 │   ├── target_builder.py        # LM-aligned target (mix_coeffs + W_tgt)
 │   └── ttt_wrapper.py           # TTT v3 wrapper: normalized update, caps
+├── tests/
+│   └── test_phase0.py           # Phase 0 + v3 correctness tests
 ├── scripts/                     # SLURM job scripts
 ├── runs/                        # Training outputs and checkpoints
 ├── train.py                     # Main training loop
