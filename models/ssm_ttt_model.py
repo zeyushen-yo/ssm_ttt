@@ -163,6 +163,17 @@ class SSMTTTModel(nn.Module):
         ttt_use_residual_fast_path: bool = False,
         ttt_target_source: str = "embedding",
         ttt_detach_source: bool = False,
+        # v4 params
+        ttt_update_rule: str = "hebb",
+        ttt_scale_mode: str = "mean",
+        ttt_normalize_z: bool = True,
+        ttt_normalize_err: bool = False,
+        ttt_disable_updates: bool = False,
+        ttt_write_gate: str = "none",
+        ttt_write_gate_max: float = 3.0,
+        ttt_center_updates: bool = False,
+        ttt_center_beta: float = 0.95,
+        ttt_shared_target_builder: bool = False,
         pad_vocab_size_multiple: int = 8,
         device=None,
         dtype=None,
@@ -187,6 +198,16 @@ class SSMTTTModel(nn.Module):
         if self.fused_add_norm:
             if layer_norm_fn is None or rms_norm_fn is None:
                 raise ImportError("Failed to import Triton LayerNorm / RMSNorm kernels")
+
+        from .target_builder import TargetBuilder
+        shared_tb = None
+        if ttt_shared_target_builder and len(self.ttt_layer_indices) > 0:
+            shared_tb = TargetBuilder(
+                d_model=d_model,
+                kernel_size=ttt_kernel_size,
+                device=device,
+                dtype=torch.float32,
+            )
 
         layers = []
         for i in range(n_layer):
@@ -218,6 +239,16 @@ class SSMTTTModel(nn.Module):
                     deltaW_rel_cap=ttt_deltaW_rel_cap,
                     g_rel_cap=ttt_G_rel_cap,
                     use_residual_fast_path=ttt_use_residual_fast_path,
+                    update_rule=ttt_update_rule,
+                    scale_mode=ttt_scale_mode,
+                    normalize_z=ttt_normalize_z,
+                    normalize_err=ttt_normalize_err,
+                    disable_updates=ttt_disable_updates,
+                    write_gate=ttt_write_gate,
+                    write_gate_max=ttt_write_gate_max,
+                    center_updates=ttt_center_updates,
+                    center_beta=ttt_center_beta,
+                    target_builder=shared_tb,
                     device=device,
                     dtype=dtype,
                 )
@@ -396,6 +427,16 @@ def create_ssm_ttt(
     ttt_use_residual_fast_path: bool = False,
     ttt_target_source: str = "embedding",
     ttt_detach_source: bool = False,
+    ttt_update_rule: str = "hebb",
+    ttt_scale_mode: str = "mean",
+    ttt_normalize_z: bool = True,
+    ttt_normalize_err: bool = False,
+    ttt_disable_updates: bool = False,
+    ttt_write_gate: str = "none",
+    ttt_write_gate_max: float = 3.0,
+    ttt_center_updates: bool = False,
+    ttt_center_beta: float = 0.95,
+    ttt_shared_target_builder: bool = False,
     **kwargs,
 ):
     """Create an SSM with in-place TTT."""
@@ -429,5 +470,15 @@ def create_ssm_ttt(
         ttt_use_residual_fast_path=ttt_use_residual_fast_path,
         ttt_target_source=ttt_target_source,
         ttt_detach_source=ttt_detach_source,
+        ttt_update_rule=ttt_update_rule,
+        ttt_scale_mode=ttt_scale_mode,
+        ttt_normalize_z=ttt_normalize_z,
+        ttt_normalize_err=ttt_normalize_err,
+        ttt_disable_updates=ttt_disable_updates,
+        ttt_write_gate=ttt_write_gate,
+        ttt_write_gate_max=ttt_write_gate_max,
+        ttt_center_updates=ttt_center_updates,
+        ttt_center_beta=ttt_center_beta,
+        ttt_shared_target_builder=ttt_shared_target_builder,
         **kwargs,
     )

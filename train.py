@@ -12,6 +12,7 @@ import json
 import math
 import os
 import signal
+import sys
 import time
 from collections import defaultdict
 
@@ -287,7 +288,10 @@ def train(config: dict):
                   f"LR: {lr:.2e} | Grad: {log_entry['grad_norm']:.4f} | "
                   f"Tok/s: {tps:.0f}")
             if ttt_diag:
-                diag_str = " | ".join(f"{k}: {v:.6f}" for k, v in ttt_diag.items())
+                diag_str = " | ".join(
+                    f"{k}: {v:.6f}" if isinstance(v, (int, float)) else f"{k}: {v}"
+                    for k, v in ttt_diag.items()
+                )
                 print(f"  TTT: {diag_str}")
 
             with open(log_file, "a") as f:

@@ -60,7 +60,7 @@ def load_val_documents(data_dir, min_len=2048):
     return docs
 
 
-def load_model_from_checkpoint(checkpoint_path, device="cuda"):
+def load_model_from_checkpoint(checkpoint_path, device="cuda", disable_ttt_updates=False):
     """Load a model from checkpoint, reconstructing the correct architecture."""
     ckpt = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
     config = ckpt["config"]
@@ -80,6 +80,13 @@ def load_model_from_checkpoint(checkpoint_path, device="cuda"):
 
     model.load_state_dict(ckpt["model_state_dict"])
     model.eval()
+
+    if disable_ttt_updates and isinstance(model, SSMTTTModel):
+        for layer in model.layers:
+            if isinstance(layer, TTTMamba2Block):
+                layer.ttt_wrapper.disable_updates = True
+        print("  ** TTT updates DISABLED for this evaluation **")
+
     return model, config
 
 
@@ -221,6 +228,109 @@ def evaluate_sliding_window_ppl(
     return results, ttt_diag_by_ctx
 
 
+@torch.no_grad()
+def evaluate_prefix_control(
+    model,
+    documents,
+    context_lengths=None,
+    scored_suffix_len=2048,
+    device="cuda",
+    dtype=torch.bfloat16,
+    mode="random",
+):
+    """
+    Evaluate with corrupted prefixes (random or shuffled) to test
+    whether TTT gain comes from specific context or just statistics.
+
+    mode="random": replace prefix with tokens from a random other document
+    mode="shuffled": keep same tokens but shuffle chunk order in the prefix
+    """
+    if context_lengths is None:
+        context_lengths = CONTEXT_LENGTHS
+
+    model.eval()
+    results = {}
+    chunk_size = 64
+
+    for L in context_lengths:
+        if L < scored_suffix_len:
+            continue
+
+        total_nll = 0.0
+        total_tokens = 0
+        n_docs = 0
+        prefix_len = L - scored_suffix_len
+
+        for doc_idx, doc in enumerate(tqdm(documents, desc=f"L={L} ({mode})", leave=False)):
+            if len(doc) < L:
+                continue
+
+            suffix = doc[-scored_suffix_len:]
+
+            if prefix_len == 0:
+                input_ids = suffix.unsqueeze(0).to(device)
+            else:
+                true_prefix = doc[-(L):-(scored_suffix_len)]
+
+                if mode == "random":
+                    donor_idx = (doc_idx + 1) % len(documents)
+                    donor = documents[donor_idx]
+                    if len(donor) >= L:
+                        fake_prefix = donor[-L:-scored_suffix_len]
+                    else:
+                        fake_prefix = donor[:prefix_len]
+                        if len(fake_prefix) < prefix_len:
+                            fake_prefix = torch.cat([fake_prefix] * (prefix_len // len(fake_prefix) + 1))[:prefix_len]
+                    input_ids = torch.cat([fake_prefix, suffix]).unsqueeze(0).to(device)
+
+                elif mode == "shuffled":
+                    n_chunks = max(1, prefix_len // chunk_size)
+                    chunks = [true_prefix[i*chunk_size:(i+1)*chunk_size] for i in range(n_chunks)]
+                    remainder = true_prefix[n_chunks*chunk_size:]
+                    perm = torch.randperm(len(chunks))
+                    shuffled = torch.cat([chunks[p] for p in perm])
+                    if len(remainder) > 0:
+                        shuffled = torch.cat([shuffled, remainder])
+                    input_ids = torch.cat([shuffled, suffix]).unsqueeze(0).to(device)
+                else:
+                    raise ValueError(f"Unknown mode: {mode}")
+
+            with torch.autocast(device_type="cuda", dtype=dtype):
+                output = model(input_ids)
+            logits = output.logits.float()
+
+            suffix_start = L - scored_suffix_len
+            if suffix_start == 0:
+                score_logits = logits[:, 0:L-1, :]
+                score_labels = input_ids[:, 1:L]
+                n_scored = L - 1
+            else:
+                score_logits = logits[:, suffix_start-1:L-1, :]
+                score_labels = input_ids[:, suffix_start:L]
+                n_scored = scored_suffix_len
+
+            nll = F.cross_entropy(
+                score_logits.reshape(-1, score_logits.size(-1)),
+                score_labels.reshape(-1),
+                reduction='sum',
+            )
+            total_nll += nll.item()
+            total_tokens += n_scored
+            n_docs += 1
+
+        if total_tokens > 0:
+            avg_nll = total_nll / total_tokens
+            ppl = math.exp(min(avg_nll, 100))
+        else:
+            avg_nll = float('inf')
+            ppl = float('inf')
+
+        results[L] = ppl
+        print(f"  Context {L:>6} ({L//1024:>2}k) [{mode:>8}]: PPL = {ppl:8.2f}  (n_docs={n_docs})")
+
+    return results
+
+
 def plot_figure2(results_dict, output_path="figure2.png", title="Sliding-Window Perplexity"):
     """Plot Figure-2 style comparison."""
     fig, ax = plt.subplots(1, 1, figsize=(8, 5))
@@ -265,6 +375,14 @@ if __name__ == "__main__":
     parser.add_argument("--max_docs", type=int, default=50)
     parser.add_argument("--context_lengths", nargs="+", type=int, default=None)
     parser.add_argument("--device", default="cuda")
+    parser.add_argument("--disable_ttt_updates", action="store_true",
+                        help="Run TTT models with updates disabled (TTT-off control)")
+    parser.add_argument("--random_prefix_control", action="store_true",
+                        help="Also evaluate with random prefixes")
+    parser.add_argument("--shuffle_prefix_control", action="store_true",
+                        help="Also evaluate with shuffled-chunk prefixes")
+    parser.add_argument("--ttt_onoff", action="store_true",
+                        help="For each TTT checkpoint, eval both TTT-on and TTT-off")
     args = parser.parse_args()
 
     assert len(args.checkpoints) == len(args.names)
@@ -279,13 +397,18 @@ if __name__ == "__main__":
 
     all_results = {}
     all_ttt_diag = {}
+    prefix_control_results = {}
+
     for ckpt_path, name in zip(args.checkpoints, args.names):
         print(f"\n{'='*60}")
         print(f"Evaluating: {name}")
         print(f"Checkpoint: {ckpt_path}")
         print(f"{'='*60}")
 
-        model, config = load_model_from_checkpoint(ckpt_path, device=args.device)
+        model, config = load_model_from_checkpoint(
+            ckpt_path, device=args.device,
+            disable_ttt_updates=args.disable_ttt_updates,
+        )
         is_ttt = config["model_type"] == "ssm_ttt"
 
         results, ttt_diag = evaluate_sliding_window_ppl(
@@ -299,17 +422,88 @@ if __name__ == "__main__":
         if ttt_diag:
             all_ttt_diag[name] = ttt_diag
 
+        if is_ttt and args.ttt_onoff:
+            print(f"\n--- TTT-OFF evaluation for {name} ---")
+            for layer in model.layers:
+                if isinstance(layer, TTTMamba2Block):
+                    layer.ttt_wrapper.disable_updates = True
+            off_results, _ = evaluate_sliding_window_ppl(
+                model, documents,
+                context_lengths=context_lengths,
+                scored_suffix_len=args.scored_suffix_len,
+                device=args.device,
+                is_ttt=False,
+            )
+            all_results[f"{name}_OFF"] = off_results
+            for layer in model.layers:
+                if isinstance(layer, TTTMamba2Block):
+                    layer.ttt_wrapper.disable_updates = False
+
+        if args.random_prefix_control:
+            print(f"\n--- Random-prefix control for {name} ---")
+            rnd_results = evaluate_prefix_control(
+                model, documents,
+                context_lengths=context_lengths,
+                scored_suffix_len=args.scored_suffix_len,
+                device=args.device,
+                mode="random",
+            )
+            prefix_control_results[f"{name}_random_prefix"] = rnd_results
+
+        if args.shuffle_prefix_control:
+            print(f"\n--- Shuffled-prefix control for {name} ---")
+            shuf_results = evaluate_prefix_control(
+                model, documents,
+                context_lengths=context_lengths,
+                scored_suffix_len=args.scored_suffix_len,
+                device=args.device,
+                mode="shuffled",
+            )
+            prefix_control_results[f"{name}_shuffled_prefix"] = shuf_results
+
         del model
         torch.cuda.empty_cache()
 
     print(f"\n{'='*60}")
-    print("SUMMARY")
+    print("SUMMARY — Standard PPL")
     print(f"{'='*60}")
-    header = f"{'Model':<20}" + "".join(f"{'%dk' % (L//1024):>8}" for L in sorted(context_lengths))
+    header = f"{'Model':<30}" + "".join(f"{'%dk' % (L//1024):>8}" for L in sorted(context_lengths))
     print(header)
     for name, results in all_results.items():
-        row = f"{name:<20}" + "".join(f"{results.get(L, float('inf')):8.2f}" for L in sorted(context_lengths))
+        row = f"{name:<30}" + "".join(f"{results.get(L, float('inf')):8.2f}" for L in sorted(context_lengths))
         print(row)
+
+    if args.ttt_onoff:
+        print(f"\n{'='*60}")
+        print("TTT ON vs OFF Gain (PPL_off - PPL_on, positive = TTT helps)")
+        print(f"{'='*60}")
+        for name in args.names:
+            on_key = name
+            off_key = f"{name}_OFF"
+            if on_key in all_results and off_key in all_results:
+                gains = []
+                row = f"{name:<30}"
+                for L in sorted(context_lengths):
+                    ppl_on = all_results[on_key].get(L, float('inf'))
+                    ppl_off = all_results[off_key].get(L, float('inf'))
+                    gain = ppl_off - ppl_on
+                    gains.append((L, gain))
+                    row += f"{gain:8.2f}"
+                print(row)
+                if len(gains) >= 2:
+                    gain_short = gains[0][1]
+                    gain_long = gains[-1][1]
+                    print(f"  Context-dependent: Gain({gains[-1][0]//1024}k) - Gain({gains[0][0]//1024}k) = {gain_long - gain_short:.2f}")
+
+    if prefix_control_results:
+        print(f"\n{'='*60}")
+        print("PREFIX CONTROL RESULTS")
+        print(f"{'='*60}")
+        header = f"{'Model':<30}" + "".join(f"{'%dk' % (L//1024):>8}" for L in sorted(context_lengths))
+        print(header)
+        for name, results in prefix_control_results.items():
+            row = f"{name:<30}" + "".join(f"{results.get(L, float('inf')):8.2f}" for L in sorted(context_lengths))
+            print(row)
 
     if all_ttt_diag:
         print(f"\nTTT Diagnostics (deltaW_rel_mean per layer):")
@@ -321,17 +515,27 @@ if __name__ == "__main__":
                 parts = " ".join(f"{k.split('/')[0]}={v:.4f}" for k, v in rel_means.items())
                 eff_w = [v for k, v in diag.items() if "effective_window_tokens" in k]
                 fg = [v for k, v in diag.items() if "fast_gate" in k]
+                err = [v for k, v in diag.items() if "err_rms_mean" in k]
+                wg = [v for k, v in diag.items() if "write_gate_mean" in k]
                 extra = ""
                 if eff_w:
                     extra += f" | eff_window={eff_w[0]:.0f}tok"
                 if fg:
                     extra += f" | fast_gate={fg[0]:.4f}"
+                if err:
+                    extra += f" | err_rms={err[0]:.4f}"
+                if wg:
+                    extra += f" | write_gate={wg[0]:.4f}"
                 print(f"    {L//1024}k: {parts}{extra}")
 
     results_path = args.output.replace(".png", "_results.json")
     save_data = {
         "ppl": {k: {str(kk): vv for kk, vv in v.items()} for k, v in all_results.items()},
     }
+    if prefix_control_results:
+        save_data["prefix_controls"] = {
+            k: {str(kk): vv for kk, vv in v.items()} for k, v in prefix_control_results.items()
+        }
     if all_ttt_diag:
         save_data["ttt_diagnostics"] = {
             name: {str(L): diag for L, diag in ctx_diag.items()}

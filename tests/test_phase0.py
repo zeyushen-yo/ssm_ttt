@@ -572,9 +572,203 @@ def test_v3_4_residual_fast_path_gate_zero():
     return ok
 
 
+def test_v4_1_delta_current_zero_error():
+    """Test v4-1: delta_current produces zero update when prediction matches target."""
+    print("\n=== Test v4-1: Delta-Current Zero-Error No-Update ===")
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    d_model, d_inner = 32, 64
+    B, span_len = 1, 16
+
+    from models.ttt_wrapper import TTTWrapper
+
+    wrapper = TTTWrapper.__new__(TTTWrapper)
+    wrapper.update_rule = "delta_current"
+    wrapper.scale_mode = "sqrt_len"
+    wrapper.normalize_z = True
+    wrapper.normalize_err = False
+    wrapper.norm_eps = 1e-6
+    wrapper.normalize_update = True
+
+    W0 = torch.randn(d_model, d_inner, device=device, dtype=torch.float32)
+    W0_t = W0.unsqueeze(0).transpose(1, 2)
+
+    z_sub = torch.randn(B, span_len, d_inner, device=device)
+    o_sub = torch.bmm(z_sub.float(), W0.unsqueeze(0).transpose(1, 2))
+    v_sub = o_sub.clone()
+
+    G, err_rms = wrapper._compute_update_matrix(z_sub, v_sub, o_sub, W0, W0_t)
+
+    G_norm = G.norm().item()
+    ok1 = print_test("G is near-zero when error is zero",
+                     G_norm < 1e-4,
+                     f"||G|| = {G_norm:.2e}")
+    ok2 = print_test("err_rms is near-zero",
+                     err_rms < 1e-4,
+                     f"err_rms = {err_rms:.2e}")
+    return all([ok1, ok2])
+
+
+def test_v4_2_scale_mode_sqrt():
+    """Test v4-2: scale_mode=sqrt_len produces correct scaling."""
+    print("\n=== Test v4-2: Scale Mode sqrt_len ===")
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    _d_model, _d_inner = 16, 32
+    B = 1
+
+    from models.ttt_wrapper import TTTWrapper
+
+    wrapper = TTTWrapper.__new__(TTTWrapper)
+    wrapper.update_rule = "hebb"
+    wrapper.normalize_z = True
+    wrapper.normalize_update = True
+    wrapper.normalize_err = False
+    wrapper.norm_eps = 1e-6
+
+    W0 = torch.randn(_d_model, _d_inner, device=device, dtype=torch.float32)
+    W0_t = W0.unsqueeze(0).transpose(1, 2)
+
+    z_16 = torch.randn(B, 16, _d_inner, device=device)
+    v_16 = torch.randn(B, 16, _d_model, device=device)
+    o_16 = torch.bmm(z_16.float(), W0_t)
+
+    z_64 = torch.randn(B, 64, _d_inner, device=device)
+    v_64 = torch.randn(B, 64, _d_model, device=device)
+    o_64 = torch.bmm(z_64.float(), W0_t)
+
+    wrapper.scale_mode = "sqrt_len"
+    G_16, _ = wrapper._compute_update_matrix(z_16, v_16, o_16, W0, W0_t)
+    G_64, _ = wrapper._compute_update_matrix(z_64, v_64, o_64, W0, W0_t)
+
+    norm_16 = G_16.norm().item()
+    norm_64 = G_64.norm().item()
+
+    wrapper.scale_mode = "mean"
+    G_16m, _ = wrapper._compute_update_matrix(z_16, v_16, o_16, W0, W0_t)
+    G_64m, _ = wrapper._compute_update_matrix(z_64, v_64, o_64, W0, W0_t)
+    norm_16m = G_16m.norm().item()
+    norm_64m = G_64m.norm().item()
+
+    ratio_sqrt = norm_64 / (norm_16 + 1e-8)
+    ratio_mean = norm_64m / (norm_16m + 1e-8)
+
+    ok = print_test("sqrt_len gives larger G_64/G_16 ratio than mean",
+                    ratio_sqrt > ratio_mean * 0.8,
+                    f"sqrt ratio={ratio_sqrt:.3f}, mean ratio={ratio_mean:.3f}")
+    return ok
+
+
+def test_v4_3_disable_updates():
+    """Test v4-3: disable_updates keeps DeltaW=0 throughout."""
+    print("\n=== Test v4-3: Disable Updates Identity ===")
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    d_model, n_layer = 128, 6
+    B, T = 1, 64
+
+    torch.manual_seed(42)
+    model = create_ssm_ttt(
+        d_model=d_model, n_layer=n_layer, d_intermediate=0, vocab_size=256,
+        ssm_cfg={"layer": "Mamba2", "d_state": 64, "d_conv": 4, "expand": 2, "headdim": 32},
+        rms_norm=True, residual_in_fp32=True, fused_add_norm=False,
+        num_ttt_layers=2, ttt_chunk_size=32, ttt_kernel_size=5,
+        ttt_normalize_update=True, ttt_deltaW_rel_cap=0.10, ttt_G_rel_cap=0.02,
+        ttt_update_rule="delta_current", ttt_scale_mode="sqrt_len",
+        ttt_disable_updates=True,
+        device=device, dtype=torch.float32,
+    )
+
+    model.eval()
+    input_ids = torch.randint(0, 256, (B, T), device=device)
+    with torch.no_grad():
+        _ = model(input_ids)
+
+    for layer in model.layers:
+        if isinstance(layer, TTTMamba2Block):
+            dw = layer._last_deltaW
+            dw_norm = dw.norm().item()
+            ok = print_test(f"Layer {layer.layer_idx}: DeltaW=0 with disable_updates",
+                           dw_norm < 1e-8,
+                           f"||DeltaW|| = {dw_norm:.2e}")
+            if not ok:
+                return False
+    return True
+
+
+def test_v4_4_boundary_b_gt_1_raises():
+    """Test v4-4: boundary_aware + B>1 raises error instead of silent fallback."""
+    print("\n=== Test v4-4: Boundary B>1 Raises Error ===")
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    d_model, n_layer = 128, 6
+    B, T = 2, 64
+
+    torch.manual_seed(42)
+    model = create_ssm_ttt(
+        d_model=d_model, n_layer=n_layer, d_intermediate=0, vocab_size=256,
+        ssm_cfg={"layer": "Mamba2", "d_state": 64, "d_conv": 4, "expand": 2, "headdim": 32},
+        rms_norm=True, residual_in_fp32=True, fused_add_norm=False,
+        num_ttt_layers=2, ttt_chunk_size=32,
+        device=device, dtype=torch.float32,
+    )
+
+    model.eval()
+    input_ids = torch.randint(0, 256, (B, T), device=device)
+    seg_ids = torch.zeros(B, T, dtype=torch.long, device=device)
+    seg_ids[:, 32:] = 1
+
+    raised = False
+    try:
+        with torch.no_grad():
+            _ = model(input_ids, segment_ids=seg_ids)
+    except ValueError as e:
+        if "batch_size=1" in str(e):
+            raised = True
+
+    ok = print_test("segment_ids + B>1 raises ValueError",
+                    raised,
+                    "Expected ValueError about batch_size=1")
+    return ok
+
+
+def test_v4_5_center_updates():
+    """Test v4-5: centered updates remove mean drift in a stationary-G setting."""
+    print("\n=== Test v4-5: Centered Updates Remove Mean Drift ===")
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    B, d_out, d_in = 1, 16, 32
+    decay = 0.95
+    eta = 0.5
+    center_beta = 0.95
+
+    G_mean = torch.ones(B, d_out, d_in, device=device) * 0.5
+
+    deltaW_plain = torch.zeros(B, d_out, d_in, device=device)
+    deltaW_centered = torch.zeros(B, d_out, d_in, device=device)
+    running_M = torch.zeros(B, d_out, d_in, device=device)
+
+    for step in range(500):
+        G = G_mean + torch.randn(B, d_out, d_in, device=device) * 0.1
+
+        deltaW_plain = decay * deltaW_plain + (1.0 - decay) * eta * G
+
+        running_M = center_beta * running_M + (1.0 - center_beta) * G
+        G_centered = G - running_M
+        deltaW_centered = decay * deltaW_centered + (1.0 - decay) * eta * G_centered
+
+    plain_norm = deltaW_plain.norm().item()
+    centered_norm = deltaW_centered.norm().item()
+
+    ok = print_test("Centered DeltaW has smaller norm than plain",
+                    centered_norm < plain_norm * 0.5,
+                    f"Plain ||DeltaW||={plain_norm:.4f}, Centered ||DeltaW||={centered_norm:.4f}")
+    return ok
+
+
 if __name__ == "__main__":
     print("=" * 60)
-    print("Phase 0: Correctness and Unit Tests (v3 + boundary-aware)")
+    print("Phase 0: Correctness and Unit Tests (v3 + v4)")
     print("=" * 60)
 
     results = {}
@@ -590,6 +784,11 @@ if __name__ == "__main__":
     results["v3_2_boundary_reset"] = test_v3_2_boundary_reset_fast_weights()
     results["v3_3_packed_segment_ids"] = test_v3_3_packed_dataset_segment_ids()
     results["v3_4_residual_fast_path_gate0"] = test_v3_4_residual_fast_path_gate_zero()
+    results["v4_1_delta_zero_error"] = test_v4_1_delta_current_zero_error()
+    results["v4_2_scale_sqrt"] = test_v4_2_scale_mode_sqrt()
+    results["v4_3_disable_updates"] = test_v4_3_disable_updates()
+    results["v4_4_boundary_b_gt_1"] = test_v4_4_boundary_b_gt_1_raises()
+    results["v4_5_center_updates"] = test_v4_5_center_updates()
 
     print("\n" + "=" * 60)
     print("Summary:")
@@ -603,5 +802,5 @@ if __name__ == "__main__":
     if all_passed:
         print("\nAll Phase 0 tests PASSED!")
     else:
-        print("\nSome tests FAILED. Fix before proceeding to Phase 1.")
+        print("\nSome tests FAILED. Fix before proceeding.")
     print("=" * 60)

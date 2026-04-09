@@ -1,18 +1,24 @@
 """
-TTT wrapper for SSM blocks — v3 with normalized discounted update.
+TTT wrapper for SSM blocks — v4 with error-corrective delta rule.
 
-Implements the revised math from the updated spec:
+Implements the updated spec v4:
+- Three update rules: hebb (v3 baseline), delta_current, delta_base
+- Three scale modes: mean, sqrt_len, sum
 - Normalized discounted update: DeltaW = decay * DeltaW + (1-decay) * eta * G
-- RMS normalization on update inputs (z, v)
+- RMS normalization on update inputs
 - Relative Frobenius cap on both G and cumulative DeltaW
 - Bounded decay range [decay_min, decay_max]
-- Optional residual fast path
+- Optional disable_updates for TTT-on/off evaluation control
+- Optional surprise-based write gating
+- Optional centered updates (mean subtraction)
+- Optional residual fast path (backup only)
 
-The execution order per chunk (unchanged):
+The execution order per chunk:
 1. Compute frozen pre-output features Z_c
-2. Apply current W_0 + DeltaW_c (or W_0 + g * DeltaW_c for residual path)
-3. Compute Vhat_c
-4. Update DeltaW_{c+1}
+2. Apply current W_0 + DeltaW_c
+3. Compute target Vhat_c
+4. Compute update G_c (hebb, delta_current, or delta_base)
+5. Update DeltaW_{c+1}
 """
 
 import torch
@@ -24,14 +30,14 @@ from .target_builder import TargetBuilder
 
 
 def rms_norm_lastdim(x, eps=1e-6):
-    """Tokenwise RMS normalization along the last dimension (spec eq. 2)."""
+    """Tokenwise RMS normalization along the last dimension."""
     rms = torch.sqrt(x.square().mean(dim=-1, keepdim=True) + eps)
     return x / rms
 
 
 def project_fro_rel(deltaW, base_norm, rho, eps=1e-8):
     """
-    Project deltaW to Frobenius ball of radius rho * base_norm (spec eq. 4).
+    Project deltaW to Frobenius ball of radius rho * base_norm.
     deltaW: [B, d_out, d_in]
     """
     dw_norm = torch.norm(deltaW.reshape(deltaW.shape[0], -1), dim=1, keepdim=True).unsqueeze(-1)
@@ -66,6 +72,16 @@ class TTTWrapper(nn.Module):
         deltaW_rel_cap: float = 0.10,
         g_rel_cap: float = 0.02,
         use_residual_fast_path: bool = False,
+        update_rule: str = "hebb",
+        scale_mode: str = "mean",
+        normalize_z: bool = True,
+        normalize_err: bool = False,
+        disable_updates: bool = False,
+        write_gate: str = "none",
+        write_gate_max: float = 3.0,
+        center_updates: bool = False,
+        center_beta: float = 0.95,
+        target_builder: "TargetBuilder" = None,
         device=None,
         dtype=None,
     ):
@@ -84,12 +100,32 @@ class TTTWrapper(nn.Module):
         self.use_residual_fast_path = use_residual_fast_path
         self.use_normalized_ema = normalize_update
 
-        self.target_builder = TargetBuilder(
-            d_model=d_model,
-            kernel_size=target_kernel_size,
-            device=device,
-            dtype=torch.float32,
-        )
+        self.update_rule = update_rule
+        self.scale_mode = scale_mode
+        self.normalize_z = normalize_z
+        self.normalize_err = normalize_err
+        self.disable_updates = disable_updates
+        self.write_gate = write_gate
+        self.write_gate_max = write_gate_max
+        self.center_updates = center_updates
+        self.center_beta = center_beta
+
+        assert update_rule in ("hebb", "delta_current", "delta_base"), \
+            f"Unknown update_rule: {update_rule}"
+        assert scale_mode in ("mean", "sqrt_len", "sum"), \
+            f"Unknown scale_mode: {scale_mode}"
+        assert write_gate in ("none", "chunk_err"), \
+            f"Unknown write_gate: {write_gate}"
+
+        if target_builder is not None:
+            self.target_builder = target_builder
+        else:
+            self.target_builder = TargetBuilder(
+                d_model=d_model,
+                kernel_size=target_kernel_size,
+                device=device,
+                dtype=torch.float32,
+            )
 
         self.log_inner_lr = nn.Parameter(
             torch.tensor(inner_lr_init, device=device, dtype=torch.float32).log()
@@ -113,6 +149,7 @@ class TTTWrapper(nn.Module):
         self.base_out_proj_bias = mamba_block.out_proj.bias
 
         self._last_diagnostics = {}
+        self._running_G_mean = None
 
     def _get_decay(self):
         """Compute bounded decay in [decay_min, decay_max] (spec eq. 6)."""
@@ -194,7 +231,7 @@ class TTTWrapper(nn.Module):
         return y  # [B, T, d_inner]
 
     def _apply_subspan(self, z_sub, deltaW, W0, W0_t, bias):
-        """Apply current DeltaW to a subspan of features."""
+        """Apply current DeltaW to a subspan of features. Returns output o_sub."""
         if self.use_residual_fast_path:
             base_o = torch.bmm(z_sub.float(), W0_t)
             fast_o = torch.bmm(z_sub.float(), deltaW.transpose(1, 2))
@@ -206,21 +243,61 @@ class TTTWrapper(nn.Module):
             o = o + bias.float().unsqueeze(0).unsqueeze(0)
         return o
 
-    def _update_deltaW(self, z_sub, v_sub, deltaW, W0_norm, eta, decay):
-        """Compute update G from a subspan and update DeltaW."""
+    def _compute_update_matrix(self, z_sub, v_sub, o_sub, W0, W0_t):
+        """
+        Compute the gradient matrix G based on the configured update_rule.
+
+        For hebb:         G = V_hat^T @ Z_norm  (original)
+        For delta_current: G = E^T @ Z_norm  where E = V_hat - sg(O_current)
+        For delta_base:    G = E^T @ Z_norm  where E = V_hat - sg(Z @ W0^T)
+        """
         B = z_sub.shape[0]
         span_len = z_sub.shape[1]
         zc_fp32 = z_sub.float()
         vc_fp32 = v_sub.float()
 
-        if self.normalize_update:
+        if self.normalize_z:
             zc_u = rms_norm_lastdim(zc_fp32, eps=self.norm_eps)
-            vc_u = rms_norm_lastdim(vc_fp32, eps=self.norm_eps)
         else:
             zc_u = zc_fp32
-            vc_u = vc_fp32
 
-        G = torch.bmm(vc_u.transpose(1, 2), zc_u) / span_len
+        if self.update_rule == "hebb":
+            if self.normalize_update:
+                vc_u = rms_norm_lastdim(vc_fp32, eps=self.norm_eps)
+            else:
+                vc_u = vc_fp32
+            signal = vc_u
+        elif self.update_rule == "delta_current":
+            o_current = o_sub.detach().float()
+            error = vc_fp32 - o_current
+            if self.normalize_err:
+                error = rms_norm_lastdim(error, eps=self.norm_eps)
+            signal = error
+        elif self.update_rule == "delta_base":
+            o_base = torch.bmm(zc_fp32, W0_t).detach()
+            error = vc_fp32 - o_base
+            if self.normalize_err:
+                error = rms_norm_lastdim(error, eps=self.norm_eps)
+            signal = error
+        else:
+            raise ValueError(f"Unknown update_rule: {self.update_rule}")
+
+        G = torch.bmm(signal.transpose(1, 2), zc_u)
+
+        if self.scale_mode == "mean":
+            G = G / span_len
+        elif self.scale_mode == "sqrt_len":
+            G = G / (span_len ** 0.5)
+
+        err_rms = None
+        if self.update_rule in ("delta_current", "delta_base"):
+            err_rms = signal.square().mean(dim=-1).sqrt().mean().item()
+
+        return G, err_rms
+
+    def _apply_update(self, G, deltaW, W0_norm, eta, decay, write_gate_val=None):
+        """Apply the update G to deltaW with decay, gating, centering, and caps."""
+        B = G.shape[0]
 
         if self.clip_tau is not None:
             G_norm = torch.norm(G.reshape(B, -1), dim=1, keepdim=True).unsqueeze(-1)
@@ -231,6 +308,17 @@ class TTTWrapper(nn.Module):
             G = project_fro_rel(G, base_norm=W0_norm, rho=self.g_rel_cap)
 
         G_fro = torch.norm(G.reshape(B, -1), dim=1).mean().item()
+
+        if self.center_updates:
+            if self._running_G_mean is None:
+                self._running_G_mean = G.detach().clone()
+            else:
+                self._running_G_mean = self.center_beta * self._running_G_mean + \
+                    (1.0 - self.center_beta) * G.detach()
+            G = G - self._running_G_mean
+
+        if write_gate_val is not None:
+            G = write_gate_val * G
 
         if decay is not None:
             if self.use_normalized_ema:
@@ -262,6 +350,12 @@ class TTTWrapper(nn.Module):
         B, T, d = u.shape
         C = self.chunk_size
 
+        if segment_ids is not None and B > 1:
+            raise ValueError(
+                "Boundary-aware TTT with segment_ids is only supported for batch_size=1. "
+                f"Got B={B}. Either set boundary_aware=false or use batch_size=1."
+            )
+
         z = self._get_pre_out_features(u, seq_idx=seq_idx)  # [B, T, d_inner]
         vhat = self.target_builder(source_embeddings, chunk_size=C, segment_ids=segment_ids)  # [B, T, d_model]
 
@@ -277,6 +371,8 @@ class TTTWrapper(nn.Module):
 
         G_fro_accum = 0.0
         G_rel_accum = 0.0
+        err_rms_accum = 0.0
+        write_gate_accum = 0.0
         n_updates = 0
         n_resets = 0
         prev_seg_id = None
@@ -293,8 +389,8 @@ class TTTWrapper(nn.Module):
 
             n_chunks_total += 1
 
-            if segment_ids is not None and B == 1:
-                seg_chunk = segment_ids[0, s:e]  # [chunk_len]
+            if segment_ids is not None:
+                seg_chunk = segment_ids[0, s:e]
                 chunk_len = e - s
 
                 subspan_starts = [0]
@@ -324,10 +420,21 @@ class TTTWrapper(nn.Module):
                     o_sub = self._apply_subspan(z_sub, deltaW, W0, W0_t, bias)
                     chunk_outputs.append(o_sub.to(u.dtype))
 
-                    if sp_e - sp_s > 0:
-                        deltaW, g_fro = self._update_deltaW(z_sub, v_sub, deltaW, W0_norm, eta, decay)
+                    if sp_e - sp_s > 0 and not self.disable_updates:
+                        G, err_rms = self._compute_update_matrix(
+                            z_sub, v_sub, o_sub, W0, W0_t)
+
+                        write_gate_val = None
+                        if self.write_gate == "chunk_err" and err_rms is not None:
+                            write_gate_val = min(err_rms, self.write_gate_max)
+                            write_gate_accum += write_gate_val
+
+                        deltaW, g_fro = self._apply_update(
+                            G, deltaW, W0_norm, eta, decay, write_gate_val)
                         G_fro_accum += g_fro
                         G_rel_accum += g_fro / (W0_norm.item() + 1e-8)
+                        if err_rms is not None:
+                            err_rms_accum += err_rms
                         n_updates += 1
 
                     prev_seg_id = cur_seg_id
@@ -338,10 +445,21 @@ class TTTWrapper(nn.Module):
                 oc = self._apply_subspan(zc, deltaW, W0, W0_t, bias)
                 outputs.append(oc.to(u.dtype))
 
-                if e - s > 0:
-                    deltaW, g_fro = self._update_deltaW(zc, vc, deltaW, W0_norm, eta, decay)
+                if e - s > 0 and not self.disable_updates:
+                    G, err_rms = self._compute_update_matrix(
+                        zc, vc, oc, W0, W0_t)
+
+                    write_gate_val = None
+                    if self.write_gate == "chunk_err" and err_rms is not None:
+                        write_gate_val = min(err_rms, self.write_gate_max)
+                        write_gate_accum += write_gate_val
+
+                    deltaW, g_fro = self._apply_update(
+                        G, deltaW, W0_norm, eta, decay, write_gate_val)
                     G_fro_accum += g_fro
                     G_rel_accum += g_fro / (W0_norm.item() + 1e-8)
+                    if err_rms is not None:
+                        err_rms_accum += err_rms
                     n_updates += 1
 
         out = torch.cat(outputs, dim=1)
@@ -357,7 +475,12 @@ class TTTWrapper(nn.Module):
             "effective_window_tokens": C / (1.0 - decay.item() + 1e-8) if decay is not None else float('inf'),
             "inner_lr": eta.item(),
             "n_resets": n_resets,
+            "update_rule": self.update_rule,
         }
+        if n_updates > 0 and self.update_rule in ("delta_current", "delta_base"):
+            diag["err_rms_mean"] = err_rms_accum / max(n_updates, 1)
+        if self.write_gate == "chunk_err" and n_updates > 0:
+            diag["write_gate_mean"] = write_gate_accum / max(n_updates, 1)
         if self.use_residual_fast_path:
             diag["fast_gate"] = self.fast_gate.item()
         if n_chunks_total > 0 and segment_ids is not None:
@@ -391,6 +514,16 @@ class TTTMamba2Block(nn.Module):
         deltaW_rel_cap: float = 0.10,
         g_rel_cap: float = 0.02,
         use_residual_fast_path: bool = False,
+        update_rule: str = "hebb",
+        scale_mode: str = "mean",
+        normalize_z: bool = True,
+        normalize_err: bool = False,
+        disable_updates: bool = False,
+        write_gate: str = "none",
+        write_gate_max: float = 3.0,
+        center_updates: bool = False,
+        center_beta: float = 0.95,
+        target_builder: "TargetBuilder" = None,
         device=None,
         dtype=None,
     ):
@@ -418,6 +551,16 @@ class TTTMamba2Block(nn.Module):
             deltaW_rel_cap=deltaW_rel_cap,
             g_rel_cap=g_rel_cap,
             use_residual_fast_path=use_residual_fast_path,
+            update_rule=update_rule,
+            scale_mode=scale_mode,
+            normalize_z=normalize_z,
+            normalize_err=normalize_err,
+            disable_updates=disable_updates,
+            write_gate=write_gate,
+            write_gate_max=write_gate_max,
+            center_updates=center_updates,
+            center_beta=center_beta,
+            target_builder=target_builder,
             device=device,
             dtype=dtype,
         )

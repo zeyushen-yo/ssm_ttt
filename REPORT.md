@@ -276,23 +276,111 @@ In-place TTT on SSMs is a valid proof-of-concept: the mechanism is stable, corre
 
 ---
 
-## 9. Status and Next Steps
+## 9. Phase A: Error-Corrective Delta Rules (v4 Spec)
 
-### Completed
-- [x] Stage 1: Config screening (7 configs at 2k, 4 models at 32k, 200M tokens)
-- [x] Phase 0: All 12 correctness tests passed
-- [x] Phase 1: 50M screening of v3 fixes → P1-D best at 50M but did not transfer to 200M
-- [x] Stage 2: s2_decay and s2_decay_optim trained at 200M tokens → both worse than Stage 1 C2
+### 9.1 Motivation
 
-### Possible Next Directions (if continuing)
-1. **Parameter-matched control**: Train a wider vanilla SSM (e.g., d_model=784) to match C2's total parameter count, to distinguish TTT adaptation gains from extra-capacity gains
-2. **Finer chunk sizes** (chunk=32) to test whether more frequent TTT updates help
-3. **Scale to batch_size≥4** at 32k to reduce gradient noise and see if SSM+TTT benefits more than vanilla from better training signal
-4. **Evaluate at 64k and 128k** to test long-context extrapolation
+The v4 spec diagnosed a fundamental limitation: the Hebbian update rule (`G = V_hat^T @ Z_norm`) may store a "stationary average correction" rather than building a "context-growing associative memory." The hypothesis was that switching to an **error-corrective delta rule** — where updates are driven by prediction residuals — would produce context-dependent gains.
+
+### 9.2 Design
+
+Four variants tested at 50M screening tokens, seq_len=32768, batch_size=1:
+
+| Config | Update Rule | Scale Mode | Description |
+|--------|------------|------------|-------------|
+| A0 | hebb | mean | v3 baseline (control) |
+| A1 | hebb | sqrt_len | Hebbian with sqrt scaling |
+| A2 | delta_current | sqrt_len | Error-corrective: E = V_hat - sg(O_current) |
+| A3 | delta_base | sqrt_len | Error-corrective: E = V_hat - sg(Z @ W0^T) |
+
+All other parameters identical (decay 0.9–0.995, G_rel_cap 0.02, deltaW_rel_cap 0.10).
+
+New implementation features:
+- Three update rules: `hebb`, `delta_current`, `delta_base`
+- Three scale modes: `mean`, `sqrt_len`, `sum`
+- `err_rms` diagnostic for delta rules
+- TTT-on/off evaluation control
+- Random-prefix and shuffled-prefix controls
+- B>1 boundary assertion (explicit error instead of silent fallback)
+- 17 Phase 0 tests all passing (12 original + 5 new v4 tests)
+
+### 9.3 Results — Standard PPL
+
+| Model | 2k | 4k | 8k | 16k | 32k |
+|-------|------|------|------|------|------|
+| **A0 (hebb+mean)** | **168.31** | **165.31** | **165.19** | **165.18** | **165.15** |
+| A1 (hebb+sqrt) | 171.48 | 168.44 | 168.38 | 168.38 | 168.38 |
+| A2 (delta_current) | 174.66 | 172.45 | 172.45 | 172.46 | 172.46 |
+| A3 (delta_base) | 176.07 | 173.37 | 173.26 | 173.25 | 173.23 |
+
+200M baselines for reference (not directly comparable due to 4× more training tokens):
+- SWA 200M: 53.82 at 32k
+- Stage 1 C2 (hebb 200M): 58.34 at 32k
+- Vanilla SSM 200M: 60.36 at 32k
+
+### 9.4 Results — TTT ON vs OFF (Same Checkpoint)
+
+This is the key diagnostic: evaluating each model with TTT updates enabled vs disabled.
+
+| Model | Gain(2k) | Gain(4k) | Gain(8k) | Gain(16k) | Gain(32k) | Context-dep |
+|-------|----------|----------|----------|-----------|-----------|-------------|
+| **A0 (hebb+mean)** | 0.76 | 1.32 | 1.39 | 1.39 | **1.40** | **+0.64** |
+| **A1 (hebb+sqrt)** | 0.85 | 1.43 | 1.50 | 1.50 | **1.50** | **+0.65** |
+| A2 (delta_current) | 0.02 | 0.04 | 0.05 | 0.05 | 0.06 | +0.03 |
+| A3 (delta_base) | 0.04 | 0.09 | 0.11 | 0.09 | 0.09 | +0.05 |
+| C2 (hebb 200M) | 1.33 | 1.88 | 1.91 | 1.92 | **1.92** | **+0.59** |
+
+`Gain(L) = PPL_off(L) - PPL_on(L)`. Positive means TTT helps.
+`Context-dep = Gain(32k) - Gain(2k)`. Positive means gain grows with context.
+
+### 9.5 Results — Prefix Corruption Controls
+
+| Model | Normal 32k | Random 32k | Shuffled 32k |
+|-------|-----------|-----------|-------------|
+| A0 (hebb+mean) | 165.15 | 171.65 (+6.5) | 166.61 (+1.5) |
+| A1 (hebb+sqrt) | 168.38 | 174.78 (+6.4) | 169.85 (+1.5) |
+| A2 (delta_current) | 172.46 | 178.75 (+6.3) | 173.73 (+1.3) |
+| A3 (delta_base) | 173.23 | 179.14 (+5.9) | 174.37 (+1.1) |
+
+Random prefix (replacing prefix with tokens from another document) degrades PPL by ~6 points for all models, confirming the SSM backbone itself uses context content. Shuffled prefix degrades by ~1.3 points, showing sequential structure matters somewhat.
+
+### 9.6 Analysis
+
+**1. The delta rule hypothesis is not supported.** Delta-current and delta-base produce near-zero TTT gains (0.06 and 0.09 PPL at 32k), while the Hebbian rule produces 1.4–1.5 points of gain. The error-corrective update rule, which was the primary algorithmic change proposed by the v4 spec, does not improve over the original Hebbian rule.
+
+**2. The Hebbian rule shows genuine context-dependent gain.** For the first time, we have clear evidence that TTT gain grows with context: Gain(32k) - Gain(2k) = 0.64–0.65 for Hebbian models. This partially addresses the concern from Section 8.2 about context-independent improvement.
+
+**3. Training loss is misleading.** A3 (delta_base) had the best training loss (4.77 vs A0's 4.86) but the worst eval PPL (173.23 vs 165.15). The delta rule appears to overfit on training data or optimize an objective that doesn't transfer to evaluation.
+
+**4. Sqrt_len scaling does not help Hebbian overall.** A1 (hebb+sqrt_len) has worse absolute PPL than A0 (hebb+mean) by ~3 points. However, A1's TTT gain is slightly higher (1.50 vs 1.40) and more context-dependent (0.65 vs 0.64), suggesting sqrt scaling makes the TTT mechanism slightly more effective but hurts the base model quality.
+
+**5. The prefix controls show context matters for all models.** The ~6-point degradation with random prefix is a property of the SSM backbone, not TTT. The small TTT-specific contribution (~1.4 PPL) is modest compared to the backbone's context usage.
 
 ---
 
-## 9. Repository Structure
+## 10. Status and Next Steps
+
+### Completed
+- [x] Stage 1: Config screening (7 configs at 2k, 4 models at 32k, 200M tokens)
+- [x] Phase 0: All 17 correctness tests passed (12 original + 5 v4)
+- [x] Phase 1: 50M screening of v3 fixes → P1-D best at 50M but did not transfer to 200M
+- [x] Stage 2: s2_decay and s2_decay_optim at 200M tokens → both worse than Stage 1 C2
+- [x] Phase A: Error-corrective delta rules (50M) → delta rules produce near-zero TTT gain; Hebbian remains superior with modest context-dependent improvement
+
+### Key Insights
+1. **Hebbian update rule is the right direction.** Despite the v4 spec's hypothesis, error-corrective delta rules failed to produce meaningful TTT gains. The Hebbian rule, while producing only modest improvements, is the only rule that shows both positive TTT gain and context-dependent growth.
+2. **TTT ON/OFF evaluation is a powerful diagnostic.** Comparing the same checkpoint with and without TTT updates isolates the true adaptation benefit from parameter count effects.
+3. **50M screening has limited predictive power.** Both Phase 1 (P1-D) and Phase A (A3 best training loss) produced misleading signals at 50M tokens.
+
+### Possible Next Steps
+1. **Scale best Phase A model (A0 or A1 hebb) to 200M tokens** with TTT-on/off evaluation to see if context-dependent gain persists at scale
+2. **Surprise gating on Hebbian rule** — use chunk error magnitude to modulate update strength
+3. **Parameter-matched control** — verify Hebbian TTT gain vs extra-capacity effect
+4. **Investigate why delta rules fail** — the near-zero gain suggests the error signal collapses or is too noisy to be useful as updates
+
+---
+
+## 11. Repository Structure
 
 ```
 ssm_ttt/
