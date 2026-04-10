@@ -86,20 +86,14 @@ All models trained on 200M tokens, seq_len=32768, batch_size=1, packed document 
 
 ### 3.3 Cross-Training Comparison
 
-SSM models have no positional encoding, so they can be fairly evaluated at any context length regardless of training seq_len. The 2k-trained models are stronger due to better batch statistics (batch_size=16 vs 1). SWA requires 32k training to avoid RoPE extrapolation.
+> **Caveat: This is NOT a fair comparison.** The 2k-trained SSM models use batch_size=16, giving 16× better gradient statistics per step than the 32k-trained models (batch_size=1). The lower PPL of 2k-trained models is primarily a batch_size effect, not evidence that shorter training is better. SWA cannot be included at 2k training due to RoPE extrapolation failure. The fair comparison is Section 3.1 (all models at 32k, batch_size=1). This table is included only to show that SSM models can be evaluated at any context length due to lack of positional encoding.
 
 | Model | Training | batch | 2k | 4k | 8k | 16k | 32k |
 |-------|----------|-------|------|------|------|------|------|
 | SWA (32kp) | 32k | 1 | 56.44 | 52.25 | 52.19 | 52.15 | 52.61 |
 | Vanilla (2k) | 2k | 16 | 51.46 | 49.22 | 49.24 | 49.24 | 49.25 |
 | C1 TTT v3 (2k) | 2k | 16 | 49.80 | 47.12 | 47.09 | 47.09 | 47.09 |
-| **C2 TTT v3 (2k)** | 2k | 16 | 49.98 | **46.74** | **46.77** | **46.77** | **46.78** |
-
-Best version of each model at 32k context:
-- **C2 TTT v3 (2k-trained)**: **46.78** (best overall)
-- C1 TTT v3 (2k-trained): 47.09
-- Vanilla SSM (2k-trained): 49.25
-- SWA Transformer (32k-trained): 52.61
+| C2 TTT v3 (2k) | 2k | 16 | 49.98 | 46.74 | 46.77 | 46.77 | 46.78 |
 
 ### 3.4 Key Takeaways
 
@@ -344,17 +338,65 @@ This is the key diagnostic: evaluating each model with TTT updates enabled vs di
 
 Random prefix (replacing prefix with tokens from another document) degrades PPL by ~6 points for all models, confirming the SSM backbone itself uses context content. Shuffled prefix degrades by ~1.3 points, showing sequential structure matters somewhat.
 
-### 9.6 Analysis
+### 9.6 Analysis (50M Screening)
 
-**1. The delta rule hypothesis is not supported.** Delta-current and delta-base produce near-zero TTT gains (0.06 and 0.09 PPL at 32k), while the Hebbian rule produces 1.4–1.5 points of gain. The error-corrective update rule, which was the primary algorithmic change proposed by the v4 spec, does not improve over the original Hebbian rule.
+**1. The delta rule hypothesis is not supported at 50M.** Delta-current and delta-base produce near-zero TTT gains (0.06 and 0.09 PPL at 32k), while the Hebbian rule produces 1.4–1.5 points of gain.
 
-**2. The Hebbian rule shows genuine context-dependent gain.** For the first time, we have clear evidence that TTT gain grows with context: Gain(32k) - Gain(2k) = 0.64–0.65 for Hebbian models. This partially addresses the concern from Section 8.2 about context-independent improvement.
+**2. The Hebbian rule shows genuine context-dependent gain.** TTT gain grows with context: Gain(32k) - Gain(2k) = 0.64–0.65 for Hebbian models.
 
-**3. Training loss is misleading.** A3 (delta_base) had the best training loss (4.77 vs A0's 4.86) but the worst eval PPL (173.23 vs 165.15). The delta rule appears to overfit on training data or optimize an objective that doesn't transfer to evaluation.
+**3. Sqrt_len scaling does not help Hebbian overall.** A1 (hebb+sqrt_len) has worse absolute PPL than A0 (hebb+mean) by ~3 points, but slightly higher TTT gain (1.50 vs 1.40).
 
-**4. Sqrt_len scaling does not help Hebbian overall.** A1 (hebb+sqrt_len) has worse absolute PPL than A0 (hebb+mean) by ~3 points. However, A1's TTT gain is slightly higher (1.50 vs 1.40) and more context-dependent (0.65 vs 0.64), suggesting sqrt scaling makes the TTT mechanism slightly more effective but hurts the base model quality.
+---
 
-**5. The prefix controls show context matters for all models.** The ~6-point degradation with random prefix is a property of the SSM backbone, not TTT. The small TTT-specific contribution (~1.4 PPL) is modest compared to the backbone's context usage.
+### 9.7 Phase A at 200M Tokens (Full Training)
+
+To obtain definitive results, the two most informative configs were trained to 200M tokens from scratch:
+- **A2 (delta_current+sqrt_len)**: The primary v4 proposal, to test whether the delta rule improves with more training
+- **A1 (hebb+sqrt_len)**: To test whether sqrt_len scaling helps Hebbian at full scale
+
+All models use seq_len=32768, batch_size=1, warmup=512 steps, total 6103 steps.
+
+#### 9.7.1 Standard PPL (All 200M Models)
+
+| Model | 2k | 4k | 8k | 16k | 32k |
+|-------|------|------|------|------|------|
+| **SWA** | **57.44** | **53.52** | **53.39** | **53.34** | **53.82** |
+| C2 (hebb+mean) | 61.33 | 58.41 | 58.35 | 58.34 | **58.34** |
+| Vanilla SSM | 63.06 | 60.41 | 60.36 | 60.35 | 60.36 |
+| A2 (delta_current) 200M | 64.05 | 61.54 | 61.52 | 61.52 | 61.53 |
+| A1 (hebb+sqrt) 200M | 64.54 | 61.40 | 61.35 | 61.35 | 61.36 |
+
+#### 9.7.2 TTT ON vs OFF (200M Models)
+
+| Model | Gain(2k) | Gain(4k) | Gain(8k) | Gain(16k) | Gain(32k) | Context-dep |
+|-------|----------|----------|----------|-----------|-----------|-------------|
+| A2 (delta_current) 200M | 0.04 | 0.06 | 0.06 | 0.07 | 0.06 | +0.02 |
+| **A1 (hebb+sqrt) 200M** | **1.50** | **2.03** | **2.06** | **2.06** | **2.06** | **+0.56** |
+| **C2 (hebb+mean) 200M** | 1.33 | 1.88 | 1.91 | 1.92 | **1.92** | **+0.59** |
+
+#### 9.7.3 Prefix Corruption Controls (200M Models)
+
+| Model | Normal 32k | Random 32k | Shuffled 32k |
+|-------|-----------|-----------|-------------|
+| Vanilla SSM | 60.36 | 65.45 (+5.1) | 62.11 (+1.8) |
+| C2 (hebb+mean) | 58.34 | 63.98 (+5.6) | 60.38 (+2.0) |
+| A1 (hebb+sqrt) | 61.36 | 67.49 (+6.1) | 63.26 (+1.9) |
+| A2 (delta_current) | 61.53 | 67.01 (+5.5) | 63.32 (+1.8) |
+| SWA | 53.82 | 58.47 (+4.7) | 55.92 (+2.1) |
+
+### 9.8 Analysis (200M — Definitive)
+
+**1. Delta-current is definitively ineffective.** At 200M tokens, A2 (delta_current) produces only 0.06 PPL of TTT gain — identical to the 50M result. More training does not help. The delta rule's error signal, which is clipped to the same G_rel_cap (0.02) as Hebbian, loses its error-corrective nature. The v4 spec's primary hypothesis (error-corrective delta rules would outperform Hebbian for pure SSMs) is conclusively disproven.
+
+**2. Both A1 and A2 are worse than vanilla SSM in absolute PPL.** A1 achieves 61.36 and A2 achieves 61.53 at 32k, both worse than Vanilla SSM (60.36). Despite the TTT mechanism being active and producing gains for A1, the sqrt_len scaling hurts the base model training enough to more than offset the TTT benefit. C2 (hebb+mean), which uses mean scaling, remains the only TTT config that beats vanilla SSM at 200M.
+
+**3. A1 (hebb+sqrt) has the largest TTT gain but worst absolute PPL.** A1's TTT gain of 2.06 at 32k exceeds C2's 1.92. But A1's TTT-OFF PPL (~63.4) is much worse than C2's TTT-OFF PPL (~60.3), meaning the base model learned less well. The sqrt_len scaling (dividing G by sqrt(64)=8 instead of 64) makes updates 8× larger before capping, which appears to distort the training dynamics.
+
+**4. C2 (hebb+mean) is confirmed as the best TTT configuration.** It is the only model that (a) beats vanilla SSM in absolute PPL, (b) shows meaningful TTT gain (1.92 at 32k), and (c) exhibits context-dependent improvement (+0.59).
+
+**5. Prefix corruption controls confirm context sensitivity is primarily from the SSM backbone.** Even vanilla SSM (no TTT) degrades by 5.1 PPL with random prefix. The TTT-specific contribution is modest: C2 degrades 0.5 more than vanilla (5.6 vs 5.1), A1 degrades 1.0 more (6.1 vs 5.1), while A2 degrades only 0.4 more (5.5 vs 5.1) — consistent with A2's near-zero TTT gain.
+
+**6. SWA still dominates by a wide margin.** 53.82 vs 58.34 (best TTT) — a 4.5 PPL gap (7.7% relative). The gap to the best TTT model (C2) has not closed compared to Stage 2 results.
 
 ---
 
@@ -365,18 +407,25 @@ Random prefix (replacing prefix with tokens from another document) degrades PPL 
 - [x] Phase 0: All 17 correctness tests passed (12 original + 5 v4)
 - [x] Phase 1: 50M screening of v3 fixes → P1-D best at 50M but did not transfer to 200M
 - [x] Stage 2: s2_decay and s2_decay_optim at 200M tokens → both worse than Stage 1 C2
-- [x] Phase A: Error-corrective delta rules (50M) → delta rules produce near-zero TTT gain; Hebbian remains superior with modest context-dependent improvement
+- [x] Phase A screening (50M): delta rules produce near-zero TTT gain
+- [x] Phase A at 200M: A2 (delta_current) and A1 (hebb+sqrt) trained to 200M tokens
+  - Delta-current definitively fails (0.06 PPL gain, identical to 50M result)
+  - Hebb+sqrt shows strong TTT gain (2.06) but worse absolute PPL than vanilla SSM
+  - C2 (hebb+mean) confirmed as the best overall TTT configuration
 
 ### Key Insights
-1. **Hebbian update rule is the right direction.** Despite the v4 spec's hypothesis, error-corrective delta rules failed to produce meaningful TTT gains. The Hebbian rule, while producing only modest improvements, is the only rule that shows both positive TTT gain and context-dependent growth.
-2. **TTT ON/OFF evaluation is a powerful diagnostic.** Comparing the same checkpoint with and without TTT updates isolates the true adaptation benefit from parameter count effects.
-3. **50M screening has limited predictive power.** Both Phase 1 (P1-D) and Phase A (A3 best training loss) produced misleading signals at 50M tokens.
+1. **Hebbian update with mean scaling (C2) is the right recipe.** It is the only configuration that simultaneously: beats vanilla SSM in absolute PPL, shows meaningful TTT gain, and exhibits context-dependent improvement. All other variants (longer decay, optimizer split, delta rules, sqrt scaling) either fail to improve or actively degrade performance.
+2. **Error-corrective delta rules are not suitable for in-place SSM TTT.** The near-zero gain persists from 50M to 200M tokens. The G_rel_cap may be a contributing factor: both Hebbian and delta rules hit the 0.02 cap, meaning the cap dominates the update magnitude and removes the delta rule's error-proportional scaling. However, even the update *direction* (error vs target) appears unhelpful.
+3. **TTT ON/OFF evaluation is a powerful diagnostic.** This revealed that C2's improvement is genuinely from online adaptation (1.92 PPL at 32k), not just extra parameters. It also definitively showed the delta rule's failure.
+4. **50M screening has limited predictive power.** Phase 1 (P1-D), Stage 2 (s2_decay_optim), and Phase A all produced misleading signals at 50M tokens. The delta rule's failure was correctly identified at 50M, but the relative ranking of Hebbian variants was less reliable.
 
-### Possible Next Steps
-1. **Scale best Phase A model (A0 or A1 hebb) to 200M tokens** with TTT-on/off evaluation to see if context-dependent gain persists at scale
-2. **Surprise gating on Hebbian rule** — use chunk error magnitude to modulate update strength
-3. **Parameter-matched control** — verify Hebbian TTT gain vs extra-capacity effect
-4. **Investigate why delta rules fail** — the near-zero gain suggests the error signal collapses or is too noisy to be useful as updates
+### Possible Next Steps (per v4 spec decision tree — Case 3)
+The v4 spec's Case 3 applies: delta-current gives constant-shift (near-zero) gain. Recommended actions:
+1. **Centered updates** — subtract running mean from G to remove stationary drift: `G_centered = G - EMA(G)`
+2. **Surprise gating** on Hebbian rule — use chunk error magnitude to selectively suppress updates on predictable chunks
+3. **Parameter-matched control** — verify C2's 1.92 PPL gain is from TTT adaptation, not extra parameter capacity
+4. **Top-heavy TTT placement** — concentrate TTT layers in upper half of network where representations are more task-specific
+5. **Boundary-aware training with long documents** — may unlock context-dependent gains at longer horizons
 
 ---
 
@@ -388,6 +437,7 @@ ssm_ttt/
 │   ├── stage1_*.yaml            # Stage 1 configs (seq_len=2048)
 │   ├── stage1_32k_*.yaml        # Stage 1 configs (seq_len=32768)
 │   ├── phase1_*.yaml            # Phase 1 screening configs (50M tokens)
+│   ├── phaseA_*.yaml            # Phase A configs (50M screening + 200M full)
 │   └── s2_*.yaml                # Stage 2 configs (200M tokens)
 ├── data/
 │   ├── dataloader.py            # DocOffset, Packed, Boundary datasets
